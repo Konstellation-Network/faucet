@@ -1,0 +1,35 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      # The image must build without the key: it is a runtime secret.
+      - run: docker build -t faucet:ci .
+      - name: secret scan
+        # The repo must never contain a private key. Every 64-hex string
+        # must be one of the public dev keys from konstellation/local_node.sh
+        # or an obvious tx-hash/placeholder in tests.
+        run: |
+          set -euo pipefail
+          hits=$(git grep -nE '(^|[^0-9a-fA-F])(0x)?[0-9a-fA-F]{64}([^0-9a-fA-F]|$)' -- ':!package-lock.json' \
+            | grep -v '88cbead91aee890d27bf06e003ade3d4e952427e88f88d31d61d3ef5e5d54305' \
+            | grep -vE '0x(abc0+|0+[0-9a-f]{1,4}|[0-9a-f]{4}0+)"' || true)
+          if [ -n "$hits" ]; then echo "possible key material:"; echo "$hits"; exit 1; fi

@@ -1,0 +1,40 @@
+# Example deployment. Copy to docker-compose.yml (git-ignored) and fill in.
+# The key comes from the environment / a secrets file, never from this repo.
+#
+#   cp .env.example .env && $EDITOR .env      # set FAUCET_PRIVATE_KEY, RPC_URL, ...
+#   docker compose -f docker-compose.example.yml up -d --build
+#
+# Testnet-only (ENGINEERING.md §18): there is no faucet on konstellation-1 and
+# the service refuses CHAIN_ID=5667 at startup.
+
+services:
+  faucet:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # Behind a reverse proxy (Coolify, Traefik, nginx) that sets X-Forwarded-For.
+      # Leave false if clients hit the container directly.
+      TRUST_PROXY: "true"
+      PORT: "8080"
+    ports:
+      - "127.0.0.1:8080:8080"
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 256m
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  # Optional: shared cooldown store for more than one faucet replica.
+  # Then set RATE_LIMIT_STORE=redis and REDIS_URL=redis://redis:6379 in .env,
+  # and `npm install redis` in the image (it is not a dependency by default).
+  # redis:
+  #   image: redis:7-alpine
+  #   restart: unless-stopped
+  #   command: ["redis-server", "--save", "", "--appendonly", "no"]

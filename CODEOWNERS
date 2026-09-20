@@ -1,0 +1,18 @@
+# Copied from the org `.github` repo's CODEOWNERS.template (GitHub has no
+# org-wide default CODEOWNERS; every repo carries its own — ENGINEERING.md §17).
+#
+# Ownership is shared across engineering, not assigned to individuals
+# (ENGINEERING.md §17), so every path is owned by every current engineer. No
+# GitHub team exists yet; swap this list for a team once one is created.
+# Update the usernames if org membership changes
+# (`gh api orgs/Konstellation-Network/members --jq '.[].login'`).
+
+* @defidevrel @Evangel90 @Levi-Ojukwu @OlolaJaco @Psalmuel01
+
+# The send path and the blocked-recipient list are where a bug spends the
+# testnet liquidity bucket or sends it somewhere unspendable. Same owners,
+# listed separately so a stricter rule (e.g. two reviewers) can be attached
+# without touching the catch-all above. CODEOWNERS is last-match-wins.
+/src/sender.ts   @defidevrel @Evangel90 @Levi-Ojukwu @OlolaJaco @Psalmuel01
+/src/blocked.ts  @defidevrel @Evangel90 @Levi-Ojukwu @OlolaJaco @Psalmuel01
+/Dockerfile      @defidevrel @Evangel90 @Levi-Ojukwu @OlolaJaco @Psalmuel01
