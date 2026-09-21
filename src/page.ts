@@ -2,7 +2,7 @@
 // from memory so `tsc` has no assets to copy. The script lives at /app.js
 // so the page can ship a CSP without 'unsafe-inline'.
 
-import type { CaptchaProvider } from "./config.js";
+import type { CaptchaProvider } from "./config.ts";
 
 export interface PageOptions {
   networkName: string;
@@ -51,6 +51,7 @@ export function contentSecurityPolicy(provider: CaptchaProvider): string {
     "style-src 'self' 'unsafe-inline'",
     "img-src 'self' data:",
     "base-uri 'none'",
+    "frame-ancestors 'none'",
     "form-action 'self'",
   ].join("; ");
 }

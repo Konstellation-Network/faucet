@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { parseEther } from "viem";
-import { ConfigError, loadConfig } from "../src/config.js";
+import { ConfigError, describeConfig, loadConfig } from "../src/config.ts";
 
 const KEY = "0x88cbead91aee890d27bf06e003ade3d4e952427e88f88d31d61d3ef5e5d54305"; // dev0, public
 const base = { FAUCET_PRIVATE_KEY: KEY, RPC_URL: "http://127.0.0.1:8545" };
@@ -62,6 +62,29 @@ describe("loadConfig", () => {
     expect(() => loadConfig({ ...base, CAPTCHA_PROVIDER: "recaptcha" })).toThrow(ConfigError);
     expect(() => loadConfig({ ...base, RATE_LIMIT_STORE: "redis" })).toThrow(/REDIS_URL/);
     expect(loadConfig({ ...base, RATE_LIMIT_STORE: "redis", REDIS_URL: "redis://r:6379" }).redisUrl).toBe("redis://r:6379");
+  });
+
+  it("lower-cases and validates the bech32 prefix", () => {
+    expect(loadConfig({ ...base, BECH32_PREFIX: "Kons" }).bech32Prefix).toBe("kons");
+    expect(loadConfig({ ...base, BECH32_PREFIX: "COSMOS" }).bech32Prefix).toBe("cosmos");
+    expect(() => loadConfig({ ...base, BECH32_PREFIX: "ko ns" })).toThrow(/BECH32_PREFIX/);
+    expect(() => loadConfig({ ...base, BECH32_PREFIX: "kons1" })).not.toThrow(); // digits are legal in an hrp
+    expect(() => loadConfig({ ...base, BECH32_PREFIX: "k".repeat(21) })).toThrow(/BECH32_PREFIX/);
+  });
+
+  it("reads proxy hops and the confirmation timeout", () => {
+    expect(loadConfig(base).trustedProxyHops).toBe(1);
+    expect(loadConfig(base).confirmTimeoutMs).toBe(20_000);
+    expect(loadConfig({ ...base, TRUSTED_PROXY_HOPS: "2", CONFIRM_TIMEOUT_SECONDS: "5" })).toMatchObject({ trustedProxyHops: 2, confirmTimeoutMs: 5_000 });
+    expect(() => loadConfig({ ...base, TRUSTED_PROXY_HOPS: "0" })).toThrow(/between/);
+  });
+
+  it("never puts the RPC URL in the log description", () => {
+    const c = loadConfig({ ...base, RPC_URL: "https://user:token@rpc.example/v1?key=abc" });
+    const d = JSON.stringify(describeConfig(c));
+    expect(d).not.toContain("token");
+    expect(d).not.toContain("key=abc");
+    expect(d).toContain("rpc.example");
   });
 
   it("bounds integers", () => {

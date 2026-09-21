@@ -8,20 +8,24 @@
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { formatEther } from "viem";
-import { createCaptchaVerifier } from "./captcha.js";
-import { ConfigError, describeConfig, loadConfig, type FaucetConfig } from "./config.js";
-import { Faucet } from "./faucet.js";
-import { APP_JS, contentSecurityPolicy, renderPage } from "./page.js";
-import { MemoryRateLimitStore, RedisRateLimitStore, type RateLimitStore } from "./ratelimit.js";
-import { createViemSender, type Sender } from "./sender.js";
+import { createCaptchaVerifier } from "./captcha.ts";
+import { ConfigError, describeConfig, loadConfig, type FaucetConfig } from "./config.ts";
+import { Faucet } from "./faucet.ts";
+import { canonicalIp, forwardedClientIp, type CanonicalIp } from "./ip.ts";
+import { APP_JS, contentSecurityPolicy, renderPage } from "./page.ts";
+import { MemoryRateLimitStore, RedisRateLimitStore, type RateLimitStore } from "./ratelimit.ts";
+import { createViemSender, payoutCost, redactUrls, type ChainStatus, type Sender } from "./sender.ts";
 
 const MAX_BODY_BYTES = 4 * 1024;
+const HEALTH_CACHE_MS = 5_000;
 
 export interface AppDeps {
   config: FaucetConfig;
   faucet: Faucet;
   sender: Sender;
   log: (msg: string, fields?: Record<string, unknown>) => void;
+  /** How long a /healthz result is reused, ms. Default 5 s. */
+  healthCacheMs?: number;
 }
 
 export type Handler = (req: IncomingMessage, res: ServerResponse) => Promise<void>;
@@ -35,20 +39,27 @@ function json(res: ServerResponse, status: number, body: unknown, extraHeaders: 
   res.end(JSON.stringify(body));
 }
 
-/** Client IP: the socket's, or the first X-Forwarded-For hop when TRUST_PROXY is on. */
-export function clientIp(req: IncomingMessage, trustProxy: boolean): string {
+/**
+ * Client IP: the socket peer, or — with TRUST_PROXY — the entry
+ * `trustedProxyHops` from the right of X-Forwarded-For (proxies append the
+ * peer; everything to the left is client-supplied). Null when the chosen
+ * entry is not an IP address, which the caller turns into a 400.
+ */
+export function clientIp(req: IncomingMessage, trustProxy: boolean, trustedProxyHops = 1): CanonicalIp | null {
   if (trustProxy) {
-    const xff = req.headers["x-forwarded-for"];
-    const first = (Array.isArray(xff) ? xff[0] : xff)?.split(",")[0]?.trim();
-    if (first) return normaliseIp(first);
+    return forwardedClientIp(req.headers["x-forwarded-for"], trustedProxyHops);
   }
-  return normaliseIp(req.socket.remoteAddress ?? "unknown");
+  return canonicalIp(req.socket.remoteAddress ?? "");
 }
 
-function normaliseIp(ip: string): string {
-  // ::ffff:1.2.3.4 → 1.2.3.4 so v4 clients get one key whichever stack they arrive on.
-  const m = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(ip);
-  return m ? m[1]! : ip;
+/** Scheme-agnostic same-origin check: the Origin's host equals the request Host. */
+function isSameOrigin(origin: string, host: string | undefined): boolean {
+  if (!host) return false;
+  try {
+    return new URL(origin).host.toLowerCase() === host.toLowerCase();
+  } catch {
+    return false;
+  }
 }
 
 async function readJsonBody(req: IncomingMessage): Promise<unknown> {
@@ -80,6 +91,7 @@ function corsHeaders(config: FaucetConfig, origin: string | undefined): Record<s
 
 export function createApp(deps: AppDeps): Handler {
   const { config, faucet, sender, log } = deps;
+  const healthCacheMs = deps.healthCacheMs ?? HEALTH_CACHE_MS;
   const page = renderPage({
     networkName: config.networkName,
     chainId: config.chainId,
@@ -96,6 +108,20 @@ export function createApp(deps: AppDeps): Handler {
     "x-frame-options": "DENY",
   };
 
+  // /healthz is unauthenticated and costs four RPC calls; one status per
+  // few seconds is plenty for a monitor and bounds what a scraper can cause.
+  let statusCache: { at: number; value: Promise<ChainStatus> } | null = null;
+  const cachedStatus = (): Promise<ChainStatus> => {
+    const now = Date.now();
+    if (statusCache && now - statusCache.at < healthCacheMs) return statusCache.value;
+    const value = sender.status();
+    statusCache = { at: now, value };
+    value.catch(() => {
+      if (statusCache?.value === value) statusCache = null;
+    });
+    return value;
+  };
+
   return async (req, res) => {
     const url = new URL(req.url ?? "/", "http://localhost");
     const cors = corsHeaders(config, req.headers.origin);
@@ -106,29 +132,38 @@ export function createApp(deps: AppDeps): Handler {
       return;
     }
 
-    if (req.method === "GET" && url.pathname === "/") {
+    const isGet = req.method === "GET" || req.method === "HEAD";
+    const body = (s: string) => (req.method === "HEAD" ? undefined : s);
+
+    if (isGet && url.pathname === "/") {
       res.writeHead(200, {
         "content-type": "text/html; charset=utf-8",
         "content-security-policy": csp,
         "cache-control": "no-store",
+        "content-length": String(Buffer.byteLength(page)),
         ...securityHeaders,
       });
-      res.end(page);
+      res.end(body(page));
       return;
     }
 
-    if (req.method === "GET" && url.pathname === "/app.js") {
-      res.writeHead(200, { "content-type": "text/javascript; charset=utf-8", "cache-control": "no-store", ...securityHeaders });
-      res.end(APP_JS);
+    if (isGet && url.pathname === "/app.js") {
+      res.writeHead(200, {
+        "content-type": "text/javascript; charset=utf-8",
+        "cache-control": "no-store",
+        "content-length": String(Buffer.byteLength(APP_JS)),
+        ...securityHeaders,
+      });
+      res.end(body(APP_JS));
       return;
     }
 
-    if (req.method === "GET" && url.pathname === "/healthz") {
+    if (isGet && url.pathname === "/healthz") {
       try {
-        const s = await sender.status();
+        const s = await cachedStatus();
         const chainOk = s.chainId === config.chainId;
         const low = s.faucetBalanceWei < config.lowBalanceWei;
-        const empty = s.faucetBalanceWei < config.amountWei;
+        const empty = s.faucetBalanceWei < payoutCost(config.amountWei, s.maxFeePerGas);
         const body = {
           status: !chainOk || empty ? "unhealthy" : low ? "degraded" : "ok",
           rpc: "reachable",
@@ -138,32 +173,53 @@ export function createApp(deps: AppDeps): Handler {
           faucetAddress: sender.address,
           faucetBalanceKash: formatEther(s.faucetBalanceWei),
           amountKash: config.amountKash,
+          maxFeePerGas: s.maxFeePerGas.toString(),
           lowBalance: low,
           ...(low ? { warning: `balance below ${formatEther(config.lowBalanceWei)} KASH` } : {}),
           ...(chainOk ? {} : { error: `RPC chain id ${s.chainId} != configured ${config.chainId}` }),
         };
         json(res, body.status === "unhealthy" ? 503 : 200, body, { ...securityHeaders, ...cors });
       } catch (e) {
-        log("healthz: rpc unreachable", { error: e instanceof Error ? e.message : String(e) });
+        log("healthz: rpc unreachable", { error: redactUrls(e instanceof Error ? e.message : String(e)) });
         json(res, 503, { status: "unhealthy", rpc: "unreachable", expectedChainId: config.chainId }, { ...securityHeaders, ...cors });
       }
       return;
     }
 
     if (req.method === "POST" && url.pathname === "/request") {
-      let body: unknown;
-      try {
-        body = await readJsonBody(req);
-      } catch (e) {
-        const msg = e instanceof Error && e.message === "body too large" ? "body too large" : "body must be JSON";
-        json(res, 400, { error: msg, code: "bad_request" }, { ...securityHeaders, ...cors });
+      const hdrs = { ...securityHeaders, ...cors };
+      // A cross-site "simple" request (text/plain, no preflight) must not be
+      // able to spend a visitor's cooldown: require the JSON content type
+      // (which forces a preflight) and refuse a foreign Origin outright.
+      const ct = (req.headers["content-type"] ?? "").split(";")[0]!.trim().toLowerCase();
+      if (ct !== "application/json") {
+        json(res, 415, { error: "content-type must be application/json", code: "bad_request" }, hdrs);
         return;
       }
-      const b = (typeof body === "object" && body !== null ? body : {}) as Record<string, unknown>;
-      const result = await faucet.request({ address: b["address"], captchaToken: b["captchaToken"], ip: clientIp(req, config.trustProxy) });
+      const origin = req.headers.origin;
+      if (origin !== undefined && Object.keys(cors).length === 0 && !isSameOrigin(origin, req.headers.host)) {
+        json(res, 403, { error: "origin not allowed", code: "forbidden_origin" }, hdrs);
+        return;
+      }
+      const ip = clientIp(req, config.trustProxy, config.trustedProxyHops);
+      if (ip === null) {
+        json(res, 400, { error: "could not determine client address", code: "bad_request" }, hdrs);
+        return;
+      }
+
+      let parsed: unknown;
+      try {
+        parsed = await readJsonBody(req);
+      } catch (e) {
+        const msg = e instanceof Error && e.message === "body too large" ? "body too large" : "body must be JSON";
+        json(res, 400, { error: msg, code: "bad_request" }, hdrs);
+        return;
+      }
+      const b = (typeof parsed === "object" && parsed !== null ? parsed : {}) as Record<string, unknown>;
+      const result = await faucet.request({ address: b["address"], captchaToken: b["captchaToken"], ip: ip.key, clientAddress: ip.address });
       if (result.ok) {
         const { ok: _ok, ...rest } = result;
-        json(res, 200, rest, { ...securityHeaders, ...cors });
+        json(res, result.confirmed ? 200 : 202, rest, hdrs);
       } else {
         const extra: Record<string, string> = { ...securityHeaders, ...cors };
         if (result.retryAfterSeconds !== undefined) extra["retry-after"] = String(result.retryAfterSeconds);
@@ -178,14 +234,14 @@ export function createApp(deps: AppDeps): Handler {
 
 async function buildStore(config: FaucetConfig): Promise<RateLimitStore> {
   if (config.rateLimitStore === "memory") return new MemoryRateLimitStore();
-  // `redis` is deliberately not a dependency of this package: add it
-  // (`npm install redis`) in the deployment that needs multi-replica cooldowns.
+  // `redis` is an optional dependency: installed by `npm ci` (so the shipped
+  // image supports this mode) but loaded only when this mode is selected.
   const modName = "redis";
   let mod: { createClient: (o: { url: string }) => { connect(): Promise<unknown> } & ConstructorParameters<typeof RedisRateLimitStore>[0] };
   try {
     mod = (await import(modName)) as typeof mod;
   } catch {
-    throw new ConfigError('RATE_LIMIT_STORE=redis needs the "redis" package installed (npm install redis)');
+    throw new ConfigError('RATE_LIMIT_STORE=redis but the optional "redis" package is not installed (npm ci without --omit=optional)');
   }
   const client = mod.createClient({ url: config.redisUrl! });
   await client.connect();
@@ -210,13 +266,14 @@ export async function main(): Promise<void> {
     rpcUrl: config.rpcUrl,
     chainId: config.chainId,
     networkName: config.networkName,
+    confirmTimeoutMs: config.confirmTimeoutMs,
   });
 
   // Refuse to start against the wrong chain: the same replay-domain
   // discipline the node applies to its own genesis (ENGINEERING.md §1).
   const status = await sender.status();
   if (status.chainId !== config.chainId) {
-    console.error(`RPC ${config.rpcUrl} reports chain id ${status.chainId}, but CHAIN_ID=${config.chainId}; refusing to start`);
+    console.error(`RPC reports chain id ${status.chainId}, but CHAIN_ID=${config.chainId}; refusing to start`);
     process.exit(2);
   }
   log("faucet starting", {

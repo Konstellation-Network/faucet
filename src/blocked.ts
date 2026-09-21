@@ -17,7 +17,7 @@
 
 import { createHash } from "node:crypto";
 import { getAddress } from "viem";
-import type { HexAddress } from "./address.js";
+import type { HexAddress } from "./address.ts";
 
 export const ZERO_ADDRESS: HexAddress = "0x0000000000000000000000000000000000000000";
 

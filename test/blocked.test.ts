@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { parseAddress, toBech32 } from "../src/address.js";
-import { blockedReason, isBlocked, MODULE_ACCOUNT_NAMES, moduleAddress, PRECOMPILE_ADDRESSES, ZERO_ADDRESS } from "../src/blocked.js";
+import { parseAddress, toBech32 } from "../src/address.ts";
+import { blockedReason, isBlocked, MODULE_ACCOUNT_NAMES, moduleAddress, PRECOMPILE_ADDRESSES, ZERO_ADDRESS } from "../src/blocked.ts";
 
 describe("blocked recipients", () => {
   it("derives module addresses the way the SDK does", () => {

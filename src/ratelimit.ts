@@ -133,7 +133,14 @@ export async function claimCooldown(
   const addrWait = await store.claim(addrKey, ttlSeconds);
   if (addrWait !== null) throw new RateLimitedError("address", addrWait);
 
-  const ipWait = await store.claim(ipKey, ttlSeconds);
+  let ipWait: number | null;
+  try {
+    ipWait = await store.claim(ipKey, ttlSeconds);
+  } catch (e) {
+    // A store error here must not leave the address claimed for the whole TTL.
+    await store.release(addrKey).catch(() => undefined);
+    throw e;
+  }
   if (ipWait !== null) {
     await store.release(addrKey);
     throw new RateLimitedError("ip", ipWait);

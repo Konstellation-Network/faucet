@@ -30,6 +30,10 @@ export interface FaucetConfig {
   host: string;
   allowedOrigins: string[];
   trustProxy: boolean;
+  /** With trustProxy: how many proxies append to X-Forwarded-For; the client is that many hops from the right. */
+  trustedProxyHops: number;
+  /** How long a request waits for the receipt before answering 202 "broadcast". */
+  confirmTimeoutMs: number;
   rateLimitStore: "memory" | "redis";
   redisUrl: string | undefined;
   captcha: {
@@ -152,11 +156,19 @@ export function loadConfig(env: Env = process.env): FaucetConfig {
     throw new ConfigError("CAPTCHA_SECRET and CAPTCHA_SITE_KEY are required when CAPTCHA_PROVIDER is set");
   }
 
+  // Bech32 prefixes are lowercase by definition (BIP-173); accept any case
+  // in the env but normalise, or "Kons" would reject every kons1… input and
+  // toBech32 would emit a mixed-case string.
+  const bech32Prefix = str(env, "BECH32_PREFIX", "kons").toLowerCase();
+  if (!/^[a-z0-9]{1,20}$/.test(bech32Prefix)) {
+    throw new ConfigError(`BECH32_PREFIX must be 1–20 alphanumeric characters, got "${bech32Prefix}"`);
+  }
+
   return {
     privateKey,
     rpcUrl,
     chainId,
-    bech32Prefix: str(env, "BECH32_PREFIX", "kons"),
+    bech32Prefix,
     amountKash,
     amountWei,
     cooldownSeconds,
@@ -165,6 +177,8 @@ export function loadConfig(env: Env = process.env): FaucetConfig {
     host,
     allowedOrigins,
     trustProxy: bool(env, "TRUST_PROXY", false),
+    trustedProxyHops: int(env, "TRUSTED_PROXY_HOPS", 1, 1, 10),
+    confirmTimeoutMs: int(env, "CONFIRM_TIMEOUT_SECONDS", 20, 1, 300) * 1000,
     rateLimitStore,
     redisUrl,
     captcha: { provider: captchaProvider, secret: captchaSecret, siteKey: captchaSiteKey },
@@ -173,10 +187,16 @@ export function loadConfig(env: Env = process.env): FaucetConfig {
   };
 }
 
-/** For logs: everything except the key. */
+/** For logs: everything except the key, and only the RPC host (the URL may carry a token). */
 export function describeConfig(c: FaucetConfig): Record<string, unknown> {
+  let rpcHost = "<unparseable>";
+  try {
+    rpcHost = new URL(c.rpcUrl).host;
+  } catch {
+    // validated at load; unreachable
+  }
   return {
-    rpcUrl: c.rpcUrl,
+    rpcHost,
     chainId: c.chainId,
     amountKash: c.amountKash,
     cooldownSeconds: c.cooldownSeconds,
@@ -184,6 +204,8 @@ export function describeConfig(c: FaucetConfig): Record<string, unknown> {
     host: c.host,
     allowedOrigins: c.allowedOrigins,
     trustProxy: c.trustProxy,
+    trustedProxyHops: c.trustedProxyHops,
+    confirmTimeoutMs: c.confirmTimeoutMs,
     rateLimitStore: c.rateLimitStore,
     captcha: c.captcha.provider,
     networkName: c.networkName,

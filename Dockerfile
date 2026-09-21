@@ -2,8 +2,11 @@
 # no release binary (ENGINEERING.md §5: `konstellation` is the one repo that
 # does). The faucet key is NOT baked in: pass FAUCET_PRIVATE_KEY at runtime
 # as a secret (see README.md "Key handling").
+#
+# The base image is pinned by digest (the multi-arch index of node:22-alpine).
+# To bump: `docker buildx imagetools inspect node:22-alpine` → Digest.
 
-FROM node:22-alpine AS build
+FROM node:22-alpine@sha256:b6f26b36c8ff49624cfdac716b8ea1138d606df02586a77d364bb5536a634f85 AS build
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --ignore-scripts
@@ -11,7 +14,7 @@ COPY tsconfig.json ./
 COPY src ./src
 RUN npm run build && npm prune --omit=dev
 
-FROM node:22-alpine
+FROM node:22-alpine@sha256:b6f26b36c8ff49624cfdac716b8ea1138d606df02586a77d364bb5536a634f85
 ENV NODE_ENV=production
 WORKDIR /app
 COPY --from=build /app/node_modules ./node_modules

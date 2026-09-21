@@ -3,7 +3,7 @@
 // must carry the widget's token as `captchaToken`; it is verified server
 // side with the provider's siteverify endpoint before anything else runs.
 
-import type { CaptchaProvider } from "./config.js";
+import type { CaptchaProvider } from "./config.ts";
 
 const VERIFY_URL: Record<Exclude<CaptchaProvider, "off">, string> = {
   hcaptcha: "https://api.hcaptcha.com/siteverify",

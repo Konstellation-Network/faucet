@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { AddressError, bech32Decode, bech32Encode, parseAddress, toBech32 } from "../src/address.js";
+import { AddressError, bech32Decode, bech32Encode, parseAddress, toBech32 } from "../src/address.ts";
 
 // dev0 from konstellation/local_node.sh (public dev key), bech32 form taken
 // from `konstellationd keys show dev0 -a` on a local node. (The `cosmos1…`

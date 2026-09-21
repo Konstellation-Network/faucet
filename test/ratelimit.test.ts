@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { claimCooldown, MemoryRateLimitStore, RateLimitedError, RedisRateLimitStore, type Clock, type RedisLikeClient } from "../src/ratelimit.js";
+import { claimCooldown, MemoryRateLimitStore, RateLimitedError, RedisRateLimitStore, type Clock, type RateLimitStore, type RedisLikeClient } from "../src/ratelimit.ts";
 
 function fakeClock(start = 1_000_000): Clock & { advance(ms: number): void } {
   let t = start;
@@ -86,6 +86,19 @@ describe("claimCooldown", () => {
     await expect(claimCooldown(store, "0xBBB", "1.1.1.1", 60)).rejects.toBeInstanceOf(RateLimitedError);
     // 0xBBB must still be free for another IP
     await expect(claimCooldown(store, "0xBBB", "2.2.2.2", 60)).resolves.toBeDefined();
+  });
+
+  it("does not leak the address claim when the ip claim throws", async () => {
+    const inner = new MemoryRateLimitStore(fakeClock());
+    const flaky: RateLimitStore = {
+      claim: async (key, ttl) => {
+        if (key.startsWith("ip:")) throw new Error("redis down");
+        return inner.claim(key, ttl);
+      },
+      release: (key) => inner.release(key),
+    };
+    await expect(claimCooldown(flaky, "0xAAA", "1.1.1.1", 60)).rejects.toThrow("redis down");
+    expect(inner.size()).toBe(0);
   });
 
   it("release frees both keys", async () => {

@@ -2,11 +2,11 @@
 // list → cooldown claims → balance check → send. Returns a typed result
 // the server maps to a status code.
 
-import { AddressError, parseAddress, toBech32, type HexAddress } from "./address.js";
-import { blockedReason } from "./blocked.js";
-import type { CaptchaVerifier } from "./captcha.js";
-import { claimCooldown, RateLimitedError, type RateLimitStore } from "./ratelimit.js";
-import type { Sender } from "./sender.js";
+import { AddressError, parseAddress, toBech32, type HexAddress } from "./address.ts";
+import { blockedReason } from "./blocked.ts";
+import type { CaptchaVerifier } from "./captcha.ts";
+import { claimCooldown, RateLimitedError, type RateLimitStore } from "./ratelimit.ts";
+import { payoutCost, redactUrls, SendError, type Sender } from "./sender.ts";
 
 export interface FaucetOptions {
   sender: Sender;
@@ -23,11 +23,14 @@ export interface FaucetOptions {
 export interface FaucetRequest {
   address: unknown;
   captchaToken?: unknown;
+  /** Rate-limit key for the client (IPv4 address or IPv6 /64, see ip.ts). */
   ip: string;
+  /** The client's full address, for the captcha provider. Defaults to `ip`. */
+  clientAddress?: string;
 }
 
 export type FaucetResult =
-  | { ok: true; txHash: `0x${string}`; to: HexAddress; toBech32: string; amountKash: string; chainId: number }
+  | { ok: true; txHash: `0x${string}`; confirmed: boolean; to: HexAddress; toBech32: string; amountKash: string; chainId: number }
   | { ok: false; status: number; code: FaucetErrorCode; error: string; retryAfterSeconds?: number };
 
 export type FaucetErrorCode =
@@ -69,7 +72,7 @@ export class Faucet {
       return { ok: false, status: 400, code: "blocked_recipient", error: "that is the faucet's own address" };
     }
 
-    if (!(await this.opts.captcha.verify(typeof req.captchaToken === "string" ? req.captchaToken : undefined, req.ip))) {
+    if (!(await this.opts.captcha.verify(typeof req.captchaToken === "string" ? req.captchaToken : undefined, req.clientAddress ?? req.ip))) {
       return { ok: false, status: 403, code: "captcha_failed", error: "captcha verification failed" };
     }
 
@@ -92,33 +95,47 @@ export class Faucet {
       throw e;
     }
 
+    // ---- pre-broadcast: a failure here provably paid nothing, refund the cooldown ----
     try {
-      const { faucetBalanceWei } = await this.opts.sender.status();
-      if (faucetBalanceWei < this.opts.amountWei) {
+      const { faucetBalanceWei, maxFeePerGas } = await this.opts.sender.status();
+      if (faucetBalanceWei < payoutCost(this.opts.amountWei, maxFeePerGas)) {
         await cooldown.release();
-        this.log("faucet empty", { balanceWei: faucetBalanceWei.toString() });
+        this.log("faucet empty", { balanceWei: faucetBalanceWei.toString(), maxFeePerGas: maxFeePerGas.toString() });
         return { ok: false, status: 503, code: "faucet_empty", error: "the faucet is out of funds; try again later" };
       }
+    } catch (e) {
+      await cooldown.release();
+      this.log("status failed", { to, ip: req.ip, error: describe(e) });
+      return { ok: false, status: 502, code: "send_failed", error: "send failed: the node did not answer" };
+    }
 
-      const txHash = await this.opts.sender.send(to, this.opts.amountWei);
-      this.log("sent", { to, ip: req.ip, txHash, amountKash: this.opts.amountKash });
+    // ---- send: only a SendError that says "pre-broadcast" gets the cooldown back.
+    // A timeout, a 5xx, "already known", "nonce too low" or anything unexpected
+    // may mean the payout is already in the mempool (PR #1 review HIGH-1). ----
+    try {
+      const { txHash, confirmed } = await this.opts.sender.send(to, this.opts.amountWei);
+      this.log(confirmed ? "sent" : "broadcast, unconfirmed", { to, ip: req.ip, txHash, amountKash: this.opts.amountKash });
       return {
         ok: true,
         txHash,
+        confirmed,
         to,
         toBech32: toBech32(to, this.opts.bech32Prefix),
         amountKash: this.opts.amountKash,
         chainId: this.opts.chainId,
       };
     } catch (e) {
-      await cooldown.release();
-      const msg = e instanceof Error ? e.message : String(e);
-      this.log("send failed", { to, ip: req.ip, error: msg });
+      const phase = e instanceof SendError ? e.phase : "post-broadcast";
+      if (phase === "pre-broadcast") await cooldown.release();
+      this.log("send failed", { to, ip: req.ip, phase, txHash: e instanceof SendError ? e.txHash : undefined, error: describe(e) });
       // The chain's own refusal reasons (blocked recipient, frozen address —
-      // STATUS.md §3) come back as RPC errors; surface the first line so the
-      // user sees why, but never the RPC URL or a stack.
-      const firstLine = msg.split("\n")[0] ?? "send failed";
-      return { ok: false, status: 502, code: "send_failed", error: `send failed: ${firstLine.slice(0, 300)}` };
+      // STATUS.md §3) are worth showing; the RPC URL and stack never are.
+      return { ok: false, status: 502, code: "send_failed", error: `send failed: ${describe(e).slice(0, 300)}` };
     }
   }
+}
+
+function describe(e: unknown): string {
+  const msg = e instanceof Error ? e.message : String(e);
+  return redactUrls(msg.split("\n")[0] ?? "error");
 }

@@ -18,7 +18,7 @@ Node, or as the Docker image built from the `Dockerfile`.
 | Route | |
 |---|---|
 | `GET /` | a one-input page |
-| `POST /request` `{ "address": "0x… \| kons1…", "captchaToken"?: "…" }` | sends `AMOUNT_KASH`, returns `{ txHash, to, toBech32, amountKash, chainId }` |
+| `POST /request` `{ "address": "0x… \| kons1…", "captchaToken"?: "…" }` (`content-type: application/json`) | sends `AMOUNT_KASH`, waits for the receipt, returns `{ txHash, confirmed, to, toBech32, amountKash, chainId }` — `200` once mined, `202` with `confirmed: false` if the receipt did not arrive within `CONFIRM_TIMEOUT_SECONDS` (the tx is broadcast) |
 | `GET /healthz` | RPC reachable, chain id matches, block height, faucet balance, `lowBalance` warning; 503 when unhealthy |
 
 `0x…` and `kons1…` are the same account on cosmos/evm (the bech32 string is
@@ -38,13 +38,26 @@ Every request goes through, in order:
    every module address from its name, so a typo fails CI, but a missing entry
    does not.
 3. **Captcha** (optional, off by default).
-4. **Cooldown claims** per address and per IP (`src/ratelimit.ts`) — taken
-   *before* the send so concurrent requests cannot double-spend, released again
-   if the send fails so an RPC hiccup does not lock a user out for a day.
-5. **Balance check**, then one **EIP-1559 transfer** via viem (`src/sender.ts`),
-   sends serialised so nonces never race.
+4. **Cooldown claims** per address and per client IP (`src/ratelimit.ts`,
+   `src/ip.ts`) — taken *before* the send so concurrent requests cannot
+   double-spend. IPv4 is keyed by address, IPv6 by its /64; v4-mapped and
+   differently-written forms of the same address are one key.
+5. **Balance check** against `amount + 21000 × maxFeePerGas`, then one
+   **EIP-1559 transfer** via viem (`src/sender.ts`), then a wait for the receipt.
 
-Errors are JSON: `400 invalid_address | blocked_recipient`, `403 captcha_failed`,
+The send has three phases and the cooldown is refunded only when a failure
+provably happened *before* the broadcast (the node rejected the tx, fee or
+gas estimation failed). A timeout on the broadcast response, an HTTP 5xx,
+"already known" or "nonce too low" may mean the payout is already in the
+mempool, so those keep the cooldown; the sender first looks the signed tx up
+by hash and, if the node has it, treats it as sent. The broadcast is never
+retried by the transport. Nonces are a local counter (fetched once, resynced
+after any nonce error): with the app-side EVM mempool the `pending` nonce
+does not move until a block lands, so per-send `eth_getTransactionCount`
+collided within one block interval.
+
+Errors are JSON: `400 invalid_address | blocked_recipient | bad_request`,
+`403 captcha_failed | forbidden_origin`, `415` (not `application/json`),
 `429 rate_limited` (with `Retry-After`), `502 send_failed` (first line of the
 node's reason — e.g. a frozen address, `x/compliance`), `503 faucet_empty`.
 
@@ -62,9 +75,11 @@ that matter:
 | `COOLDOWN_SECONDS` | `86400` | per address *and* per IP |
 | `LOW_BALANCE_KASH` | `100 × AMOUNT_KASH` | `/healthz` reports `degraded` below this |
 | `PORT` / `HOST` | `8080` / `0.0.0.0` | |
-| `ALLOWED_ORIGINS` | empty | comma-separated origins for cross-origin API calls. The built-in page is same-origin and needs none. `*` is refused unless `NODE_ENV=development`. |
-| `TRUST_PROXY` | `false` | take the client IP from `X-Forwarded-For`. Only behind a proxy you control, else the per-IP limit is spoofable. |
-| `RATE_LIMIT_STORE` | `memory` | `redis` for several replicas (`REDIS_URL`; `npm install redis` in that deployment — not a default dependency) |
+| `ALLOWED_ORIGINS` | empty | comma-separated origins for cross-origin API calls. The built-in page is same-origin and needs none. A `POST` carrying any other `Origin` is refused (403). `*` is refused unless `NODE_ENV=development`. |
+| `TRUST_PROXY` | `false` | take the client IP from `X-Forwarded-For`. **Only** behind a proxy you control: with it on and no proxy, the header is client-supplied. |
+| `TRUSTED_PROXY_HOPS` | `1` | how many proxies append to `X-Forwarded-For`; the client is that many entries from the *right* (everything further left is client-supplied and ignored). A non-IP in that slot is a 400. |
+| `CONFIRM_TIMEOUT_SECONDS` | `20` | how long a request waits for the receipt before answering `202` |
+| `RATE_LIMIT_STORE` | `memory` | `redis` for several replicas (`REDIS_URL`). `redis` is an optional dependency, installed by `npm ci` and by the Docker image, loaded only in this mode. |
 | `CAPTCHA_PROVIDER` | `off` | `hcaptcha` or `turnstile`, with `CAPTCHA_SITE_KEY` + `CAPTCHA_SECRET`. **Off by default — turn it on before the faucet is public.** |
 | `EXPLORER_TX_URL` | — | e.g. `https://explorer…/tx/{hash}` for the result link |
 
@@ -75,8 +90,12 @@ that matter:
   key that exists on konstellation-1.
 - It arrives **only** through `FAUCET_PRIVATE_KEY`: a Coolify/Docker secret or
   an env file outside the repo. `.env` is git-ignored; `.env.example` has the
-  variable with no value; CI greps every commit for 64-hex strings and fails on
-  anything that is not the public dev0 key from `konstellation/local_node.sh`.
+  variable with no value. CI runs `scripts/secret-scan.mjs` over **every commit
+  reachable from HEAD** (not just the tree): any 32-byte hex string that is not
+  exactly the public dev0 key from `konstellation/local_node.sh` (or an obvious
+  placeholder) and any run of 12+ BIP-39 words fails the build.
+- Logs never carry the RPC URL (it may hold a token), only its host; RPC error
+  text is URL-redacted before it reaches a log or a response.
 - Top it up from the liquidity bucket in tranches rather than parking the
   whole bucket on it; `/healthz` says when it is low, and the startup log
   prints the balance.
@@ -87,7 +106,7 @@ that matter:
 
 ```bash
 npm ci
-npm run typecheck && npm test      # 47 tests, no network needed
+npm run typecheck && npm test      # 80 tests, no network needed (viem runs against an in-memory fake node)
 npm run build && FAUCET_PRIVATE_KEY=… RPC_URL=… npm start
 # or, during development, with a .env file:
 npm run dev
@@ -106,7 +125,7 @@ curl -s -X POST -H 'content-type: application/json' \
 
 ## Deployment
 
-`Dockerfile` builds a small image (`node:22-alpine`, non-root, no key inside).
+`Dockerfile` builds a small image (`node:22-alpine` pinned by digest, non-root, no key inside).
 `docker-compose.example.yml` shows the intended shape: read-only filesystem,
 all capabilities dropped, bound to localhost behind the platform's reverse
 proxy. Per `ENGINEERING.md §9.1` the faucet is stateless app-tier and belongs
@@ -118,7 +137,7 @@ Checklist before it is public:
 
 - [ ] a dedicated faucet key, funded from the testnet liquidity bucket
 - [ ] `CAPTCHA_PROVIDER` on, keys set
-- [ ] `TRUST_PROXY=true` only if the proxy sets `X-Forwarded-For`
+- [ ] `TRUST_PROXY=true` only if the proxy sets `X-Forwarded-For`, with `TRUSTED_PROXY_HOPS` = the number of proxies in front
 - [ ] `ALLOWED_ORIGINS` set only if `docs` or another site will call the API directly
 - [ ] `/healthz` wired into monitoring (`infra/monitoring`) — alert on `degraded`
 - [ ] `AMOUNT_KASH` / `COOLDOWN_SECONDS` set to the agreed policy (defaults are placeholders)
@@ -131,11 +150,13 @@ src/
 ├── server.ts      node:http routes, CORS, security headers, startup checks
 ├── faucet.ts      the request pipeline (HTTP-agnostic, fully unit-tested)
 ├── address.ts     0x / kons1 parsing, bech32 codec
+├── ip.ts          X-Forwarded-For hop selection, IPv4/IPv6 canonical keys
 ├── blocked.ts     module accounts + precompiles + zero address (copy of the chain's list)
 ├── ratelimit.ts   RateLimitStore interface, memory + redis implementations
-├── sender.ts      viem: EIP-1559 send, chain status
+├── sender.ts      viem: prepare / broadcast / confirm phases, local nonce counter, fee quote
 ├── captcha.ts     hCaptcha / Turnstile siteverify
 ├── config.ts      env parsing and validation
 └── page.ts        the static page and its script
-test/              vitest; a mocked Sender stands in for the chain
+test/              vitest; test/fake-rpc.ts is an in-memory JSON-RPC node for the real sender
+scripts/           secret-scan.mjs (CI)
 ```

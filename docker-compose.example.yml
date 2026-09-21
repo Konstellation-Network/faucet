@@ -13,9 +13,12 @@ services:
     restart: unless-stopped
     env_file: .env
     environment:
-      # Behind a reverse proxy (Coolify, Traefik, nginx) that sets X-Forwarded-For.
-      # Leave false if clients hit the container directly.
+      # Behind a reverse proxy (Coolify, Traefik, nginx) that appends the peer
+      # to X-Forwarded-For. The client is TRUSTED_PROXY_HOPS entries from the
+      # right. Set TRUST_PROXY=false if clients hit the container directly —
+      # with no proxy the header is whatever the client sends.
       TRUST_PROXY: "true"
+      TRUSTED_PROXY_HOPS: "1"
       PORT: "8080"
     ports:
       - "127.0.0.1:8080:8080"
@@ -32,8 +35,8 @@ services:
       options: { max-size: "10m", max-file: "3" }
 
   # Optional: shared cooldown store for more than one faucet replica.
-  # Then set RATE_LIMIT_STORE=redis and REDIS_URL=redis://redis:6379 in .env,
-  # and `npm install redis` in the image (it is not a dependency by default).
+  # Then set RATE_LIMIT_STORE=redis and REDIS_URL=redis://redis:6379 in .env;
+  # the redis client ships in the image as an optional dependency.
   # redis:
   #   image: redis:7-alpine
   #   restart: unless-stopped
