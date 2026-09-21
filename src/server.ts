@@ -52,14 +52,28 @@ export function clientIp(req: IncomingMessage, trustProxy: boolean, trustedProxy
   return canonicalIp(req.socket.remoteAddress ?? "");
 }
 
-/** Scheme-agnostic same-origin check: the Origin's host equals the request Host. */
-function isSameOrigin(origin: string, host: string | undefined): boolean {
-  if (!host) return false;
+/**
+ * Is `origin` where this faucet's own page is served from? Compared by host
+ * against the request Host, or — behind a proxy that rewrites Host — the
+ * first X-Forwarded-Host entry (only with TRUST_PROXY), or PUBLIC_ORIGIN.
+ */
+export function isOwnOrigin(origin: string, req: IncomingMessage, config: Pick<FaucetConfig, "trustProxy" | "publicOrigin">): boolean {
+  let originHost: string;
   try {
-    return new URL(origin).host.toLowerCase() === host.toLowerCase();
+    const u = new URL(origin);
+    originHost = u.host.toLowerCase();
+    if (config.publicOrigin !== undefined && u.origin.toLowerCase() === config.publicOrigin) return true;
   } catch {
     return false;
   }
+  const candidates: string[] = [];
+  if (req.headers.host) candidates.push(req.headers.host);
+  if (config.trustProxy) {
+    const xfh = req.headers["x-forwarded-host"];
+    const first = (Array.isArray(xfh) ? xfh[0] : xfh)?.split(",")[0]?.trim();
+    if (first) candidates.push(first);
+  }
+  return candidates.some((h) => h.toLowerCase() === originHost);
 }
 
 async function readJsonBody(req: IncomingMessage): Promise<unknown> {
@@ -197,7 +211,7 @@ export function createApp(deps: AppDeps): Handler {
         return;
       }
       const origin = req.headers.origin;
-      if (origin !== undefined && Object.keys(cors).length === 0 && !isSameOrigin(origin, req.headers.host)) {
+      if (origin !== undefined && Object.keys(cors).length === 0 && !isOwnOrigin(origin, req, config)) {
         json(res, 403, { error: "origin not allowed", code: "forbidden_origin" }, hdrs);
         return;
       }
@@ -223,7 +237,8 @@ export function createApp(deps: AppDeps): Handler {
       } else {
         const extra: Record<string, string> = { ...securityHeaders, ...cors };
         if (result.retryAfterSeconds !== undefined) extra["retry-after"] = String(result.retryAfterSeconds);
-        json(res, result.status, { error: result.error, code: result.code, ...(result.retryAfterSeconds !== undefined ? { retryAfterSeconds: result.retryAfterSeconds } : {}) }, extra);
+        const { ok: _ok, status, ...errBody } = result;
+        json(res, status, errBody, extra);
       }
       return;
     }
@@ -267,11 +282,18 @@ export async function main(): Promise<void> {
     chainId: config.chainId,
     networkName: config.networkName,
     confirmTimeoutMs: config.confirmTimeoutMs,
+    lookupWindowMs: config.lookupWindowMs,
   });
 
   // Refuse to start against the wrong chain: the same replay-domain
   // discipline the node applies to its own genesis (ENGINEERING.md §1).
-  const status = await sender.status();
+  let status;
+  try {
+    status = await sender.status();
+  } catch (e) {
+    console.error(`cannot reach the RPC: ${redactUrls(e instanceof Error ? e.message : String(e))}`);
+    process.exit(2);
+  }
   if (status.chainId !== config.chainId) {
     console.error(`RPC reports chain id ${status.chainId}, but CHAIN_ID=${config.chainId}; refusing to start`);
     process.exit(2);
@@ -302,7 +324,7 @@ export async function main(): Promise<void> {
   const handler = createApp({ config, faucet, sender, log });
   const server = createServer((req, res) => {
     handler(req, res).catch((e: unknown) => {
-      log("unhandled error", { error: e instanceof Error ? e.message : String(e) });
+      log("unhandled error", { error: redactUrls(e instanceof Error ? e.message : String(e)) });
       if (!res.headersSent) json(res, 500, { error: "internal error" });
       else res.end();
     });

@@ -45,21 +45,33 @@ Every request goes through, in order:
 5. **Balance check** against `amount + 21000 × maxFeePerGas`, then one
    **EIP-1559 transfer** via viem (`src/sender.ts`), then a wait for the receipt.
 
-The send has three phases and the cooldown is refunded only when a failure
-provably happened *before* the broadcast (the node rejected the tx, fee or
-gas estimation failed). A timeout on the broadcast response, an HTTP 5xx,
-"already known" or "nonce too low" may mean the payout is already in the
-mempool, so those keep the cooldown; the sender first looks the signed tx up
-by hash and, if the node has it, treats it as sent. The broadcast is never
-retried by the transport. Nonces are a local counter (fetched once, resynced
-after any nonce error): with the app-side EVM mempool the `pending` nonce
+The send has three phases. A failure the node *answered* with (a rejection,
+"nonce too low", fee or gas estimation) is **pre-broadcast**: the tx provably
+never entered the pool, the cooldown is refunded. A lost response (timeout,
+connection error, HTTP 5xx from a proxy) is the one real ambiguity: the
+sender then looks the locally-signed tx up by hash for `LOOKUP_WINDOW_SECONDS`
+(≥ 2 block intervals — on this chain `eth_getTransactionByHash` only answers
+once the tx is included) and, if it appears, reports success with the hash.
+Only when it never appears is the result **post-broadcast**: `502` with
+`phase: "post-broadcast"`, the `txHash` to look for, and the words "you may
+still have been paid — check the explorer; the cooldown stands". The
+broadcast is never retried by the transport.
+
+Nonces are a local counter: with the app-side EVM mempool the `pending` nonce
 does not move until a block lands, so per-send `eth_getTransactionCount`
-collided within one block interval.
+collided within one block interval. The counter goes stale whenever anything
+else spends the key — a second replica, an operator's manual tx — so a
+node-answered nonce complaint resyncs it and retries once *inside the same
+request* (two instances alternating on one key every 2 s: every request
+`200`). It is also dropped after a receipt wait times out, so an evicted tx
+cannot leave a nonce gap until restart.
 
 Errors are JSON: `400 invalid_address | blocked_recipient | bad_request`,
 `403 captcha_failed | forbidden_origin`, `415` (not `application/json`),
-`429 rate_limited` (with `Retry-After`), `502 send_failed` (first line of the
-node's reason — e.g. a frozen address, `x/compliance`), `503 faucet_empty`.
+`429 rate_limited` (with `Retry-After`), `502 send_failed` with
+`phase: "pre-broadcast"` (nothing was paid; the node's reason — e.g. a frozen
+address, `x/compliance`) or `phase: "post-broadcast"` + `txHash` (may have
+been paid, see above), `503 faucet_empty`.
 
 ## Configuration
 
@@ -76,10 +88,12 @@ that matter:
 | `LOW_BALANCE_KASH` | `100 × AMOUNT_KASH` | `/healthz` reports `degraded` below this |
 | `PORT` / `HOST` | `8080` / `0.0.0.0` | |
 | `ALLOWED_ORIGINS` | empty | comma-separated origins for cross-origin API calls. The built-in page is same-origin and needs none. A `POST` carrying any other `Origin` is refused (403). `*` is refused unless `NODE_ENV=development`. |
+| `PUBLIC_ORIGIN` | — | the origin the page is served from, e.g. `https://faucet.testnet-1.konstellation.network`. Needed only when the proxy rewrites `Host` and does not send `X-Forwarded-Host` (with `TRUST_PROXY` the first `X-Forwarded-Host` entry is also accepted); otherwise "own origin" is judged by the request `Host`. |
 | `TRUST_PROXY` | `false` | take the client IP from `X-Forwarded-For`. **Only** behind a proxy you control: with it on and no proxy, the header is client-supplied. |
 | `TRUSTED_PROXY_HOPS` | `1` | how many proxies append to `X-Forwarded-For`; the client is that many entries from the *right* (everything further left is client-supplied and ignored). A non-IP in that slot is a 400. |
 | `CONFIRM_TIMEOUT_SECONDS` | `20` | how long a request waits for the receipt before answering `202` |
-| `RATE_LIMIT_STORE` | `memory` | `redis` for several replicas (`REDIS_URL`). `redis` is an optional dependency, installed by `npm ci` and by the Docker image, loaded only in this mode. |
+| `LOOKUP_WINDOW_SECONDS` | `3` | after a lost broadcast response: how long to look for the tx by hash before answering post-broadcast |
+| `RATE_LIMIT_STORE` | `memory` | `redis` for several replicas (`REDIS_URL`). The `redis` client is an optional dependency: `npm ci` installs it locally, the Docker image includes it only with `--build-arg WITH_REDIS=1`. |
 | `CAPTCHA_PROVIDER` | `off` | `hcaptcha` or `turnstile`, with `CAPTCHA_SITE_KEY` + `CAPTCHA_SECRET`. **Off by default — turn it on before the faucet is public.** |
 | `EXPLORER_TX_URL` | — | e.g. `https://explorer…/tx/{hash}` for the result link |
 
@@ -106,7 +120,7 @@ that matter:
 
 ```bash
 npm ci
-npm run typecheck && npm test      # 80 tests, no network needed (viem runs against an in-memory fake node)
+npm run typecheck && npm test      # 92 tests, no network needed (viem runs against an in-memory fake node)
 npm run build && FAUCET_PRIVATE_KEY=… RPC_URL=… npm start
 # or, during development, with a .env file:
 npm run dev
@@ -125,7 +139,8 @@ curl -s -X POST -H 'content-type: application/json' \
 
 ## Deployment
 
-`Dockerfile` builds a small image (`node:22-alpine` pinned by digest, non-root, no key inside).
+`Dockerfile` builds a small image (`node:22-alpine` pinned by digest, non-root,
+no key inside; `--build-arg WITH_REDIS=1` for the multi-replica variant).
 `docker-compose.example.yml` shows the intended shape: read-only filesystem,
 all capabilities dropped, bound to localhost behind the platform's reverse
 proxy. Per `ENGINEERING.md §9.1` the faucet is stateless app-tier and belongs
@@ -137,7 +152,7 @@ Checklist before it is public:
 
 - [ ] a dedicated faucet key, funded from the testnet liquidity bucket
 - [ ] `CAPTCHA_PROVIDER` on, keys set
-- [ ] `TRUST_PROXY=true` only if the proxy sets `X-Forwarded-For`, with `TRUSTED_PROXY_HOPS` = the number of proxies in front
+- [ ] `TRUST_PROXY=true` only if the proxy sets `X-Forwarded-For`, with `TRUSTED_PROXY_HOPS` = the number of proxies in front; `PUBLIC_ORIGIN` if it rewrites `Host` without `X-Forwarded-Host`
 - [ ] `ALLOWED_ORIGINS` set only if `docs` or another site will call the API directly
 - [ ] `/healthz` wired into monitoring (`infra/monitoring`) — alert on `degraded`
 - [ ] `AMOUNT_KASH` / `COOLDOWN_SECONDS` set to the agreed policy (defaults are placeholders)

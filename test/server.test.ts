@@ -6,8 +6,8 @@ import { noCaptcha } from "../src/captcha.ts";
 import { loadConfig } from "../src/config.ts";
 import { Faucet } from "../src/faucet.ts";
 import { MemoryRateLimitStore } from "../src/ratelimit.ts";
-import type { Sender } from "../src/sender.ts";
-import { createApp } from "../src/server.ts";
+import { createApp, isOwnOrigin } from "../src/server.ts";
+import { redactUrls, SendError } from "../src/sender.ts";
 
 const DEV0 = "0xC6Fe5D33615a1C52c08018c47E8Bc53646A0E101";
 const DEV1 = "0x963EBDf2e1f8DB8707D05FC75bfeFFBa1B5BaC17";
@@ -16,16 +16,21 @@ const KEY = "0x88cbead91aee890d27bf06e003ade3d4e952427e88f88d31d61d3ef5e5d54305"
 interface Harness {
   base: string;
   sent: string[];
-  state: { balance: bigint; maxFeePerGas: bigint; rpcDown: boolean; confirmed: boolean; statusCalls: number };
+  state: { balance: bigint; maxFeePerGas: bigint; rpcDown: boolean; confirmed: boolean; statusCalls: number; failWith: Error | null };
   close(): Promise<void>;
 }
 
 async function harness(env: Record<string, string>, healthCacheMs = 0): Promise<Harness> {
-  const state = { balance: parseEther("5000"), maxFeePerGas: 0n, rpcDown: false, confirmed: true, statusCalls: 0 };
+  const state = { balance: parseEther("5000"), maxFeePerGas: 0n, rpcDown: false, confirmed: true, statusCalls: 0, failWith: null as Error | null };
   const sent: string[] = [];
-  const sender: Sender = {
+  const sender: import("../src/sender.ts").Sender = {
     address: "0x40a0cb1C63e026A81B55EE1308586E21eec1eFa9",
     async send(to) {
+      if (state.failWith) {
+        const e = state.failWith;
+        state.failWith = null;
+        throw e;
+      }
       sent.push(to);
       return { txHash: "0xabc0000000000000000000000000000000000000000000000000000000000000", confirmed: state.confirmed };
     },
@@ -181,9 +186,65 @@ describe("HTTP server (behind a proxy)", () => {
     expect((await post(h.base, { address: fresh }, { ...xff, origin: "https://good.example" })).status).toBe(200);
   });
 
+  it("accepts its own page's Origin behind a proxy that rewrites Host (X-Forwarded-Host)", async () => {
+    const fresh = "0x0000000000000000000000000000000000005555";
+    const xff = { ...JSON_CT, "x-forwarded-for": "203.0.113.80" };
+    // Host is the container's; the public host arrives in X-Forwarded-Host.
+    const ok = await post(h.base, { address: fresh }, { ...xff, origin: "https://faucet.example", "x-forwarded-host": "faucet.example, internal" });
+    expect(ok.status).toBe(200);
+    // Without the forwarded host the Origin is foreign to this Host.
+    const no = await post(h.base, { address: fresh }, { ...xff, origin: "https://faucet.example" });
+    expect(no.status).toBe(403);
+  });
+
+  it("returns the post-broadcast guidance in the error body and keeps the cooldown", async () => {
+    const h2 = await harness({});
+    try {
+      const hash = `0x${"cd".repeat(32)}` as const;
+      h2.state.failWith = new SendError("post-broadcast", "The request took too long to respond.", hash);
+      const res = await post(h2.base, { address: DEV1 });
+      expect(res.status).toBe(502);
+      const body = (await res.json()) as Record<string, unknown>;
+      expect(body).toMatchObject({ code: "send_failed", phase: "post-broadcast", txHash: hash });
+      expect(body["error"]).toMatch(/may still have been paid .* cooldown stands/);
+      expect((await post(h2.base, { address: DEV1 })).status).toBe(429);
+    } finally {
+      await h2.close();
+    }
+  });
+
   it("404s everything else", async () => {
     expect((await fetch(`${h.base}/nope`)).status).toBe(404);
     expect((await fetch(`${h.base}/request`)).status).toBe(404);
+  });
+});
+
+describe("isOwnOrigin", () => {
+  const req = (headers: Record<string, string>) => ({ headers }) as unknown as import("node:http").IncomingMessage;
+  it("matches the request Host regardless of scheme", () => {
+    expect(isOwnOrigin("https://faucet.example", req({ host: "faucet.example" }), { trustProxy: false, publicOrigin: undefined })).toBe(true);
+    expect(isOwnOrigin("http://faucet.example:8080", req({ host: "Faucet.Example:8080" }), { trustProxy: false, publicOrigin: undefined })).toBe(true);
+    expect(isOwnOrigin("https://evil.example", req({ host: "faucet.example" }), { trustProxy: false, publicOrigin: undefined })).toBe(false);
+  });
+  it("uses X-Forwarded-Host only with TRUST_PROXY", () => {
+    const r = req({ host: "faucet:8080", "x-forwarded-host": "faucet.example" });
+    expect(isOwnOrigin("https://faucet.example", r, { trustProxy: true, publicOrigin: undefined })).toBe(true);
+    expect(isOwnOrigin("https://faucet.example", r, { trustProxy: false, publicOrigin: undefined })).toBe(false);
+  });
+  it("accepts PUBLIC_ORIGIN exactly", () => {
+    const r = req({ host: "faucet:8080" });
+    expect(isOwnOrigin("https://faucet.example", r, { trustProxy: false, publicOrigin: "https://faucet.example" })).toBe(true);
+    expect(isOwnOrigin("http://faucet.example", r, { trustProxy: false, publicOrigin: "https://faucet.example" })).toBe(false);
+    expect(isOwnOrigin("not a url", r, { trustProxy: false, publicOrigin: "https://faucet.example" })).toBe(false);
+  });
+});
+
+describe("redactUrls", () => {
+  it("strips http(s), redis and any other scheme URL", () => {
+    expect(redactUrls("ECONNREFUSED http://rpc.example/v1?key=abc more")).toBe("ECONNREFUSED <url> more");
+    expect(redactUrls("redis://:hunter2@redis:6379 down")).toBe("<url> down");
+    expect(redactUrls('URL: "https://user:pw@h/p"')).toBe('URL: "<url>"');
+    expect(redactUrls("no urls here 1:2")).toBe("no urls here 1:2");
   });
 });
 

@@ -7,12 +7,16 @@
 # To bump: `docker buildx imagetools inspect node:22-alpine` → Digest.
 
 FROM node:22-alpine@sha256:b6f26b36c8ff49624cfdac716b8ea1138d606df02586a77d364bb5536a634f85 AS build
+# WITH_REDIS=1 keeps the optional `redis` client (RATE_LIMIT_STORE=redis, for
+# more than one replica). The default image leaves it out: ~14 MB / 6
+# packages that a single replica never loads.
+ARG WITH_REDIS=0
 WORKDIR /app
 COPY package.json package-lock.json ./
-RUN npm ci --ignore-scripts
+RUN if [ "$WITH_REDIS" = "1" ]; then npm ci --ignore-scripts; else npm ci --ignore-scripts --omit=optional; fi
 COPY tsconfig.json ./
 COPY src ./src
-RUN npm run build && npm prune --omit=dev
+RUN npm run build && if [ "$WITH_REDIS" = "1" ]; then npm prune --omit=dev; else npm prune --omit=dev --omit=optional; fi
 
 FROM node:22-alpine@sha256:b6f26b36c8ff49624cfdac716b8ea1138d606df02586a77d364bb5536a634f85
 ENV NODE_ENV=production

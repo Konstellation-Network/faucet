@@ -15,6 +15,7 @@ function build(rpc: FakeRpc, extra: Partial<Parameters<typeof createViemSender>[
     transport: rpc.transport(),
     confirmTimeoutMs: 400,
     pollIntervalMs: 10,
+    lookupWindowMs: 300,
     ...extra,
   });
 }
@@ -69,7 +70,7 @@ describe("viem sender: nonces", () => {
     }
   });
 
-  it("resyncs the nonce after a stale-nonce rejection and refunds (pre-broadcast)", async () => {
+  it("resyncs and retries inside the same request after a node-answered 'nonce too low'", async () => {
     const rpc = new FakeRpc({ minedNonce: 0 });
     const sender = build(rpc);
     const stop = miner(rpc);
@@ -77,13 +78,55 @@ describe("viem sender: nonces", () => {
       await sender.send(DEV1, 1n); // nonce 0, mined
       // Something else (an operator's manual tx) consumed nonces 1 and 2.
       rpc.minedNonce = 3;
-      const err = await sender.send(DEV1, 1n).catch((e: unknown) => e);
-      expect(err).toBeInstanceOf(SendError);
-      expect((err as SendError).phase).toBe("post-broadcast"); // "nonce too low" is never refunded
-      // …but the counter is resynced, so the next send works.
+      const sends = rpc.calls.filter((c) => c === "eth_sendRawTransaction").length;
       const r = await sender.send(DEV1, 1n);
       expect(r.confirmed).toBe(true);
       expect(rpc.mined.get(r.txHash)!.tx.nonce).toBe(3);
+      expect(rpc.calls.filter((c) => c === "eth_sendRawTransaction").length - sends).toBe(2); // one rejected, one accepted
+    } finally {
+      stop();
+    }
+  });
+
+  it("gives up after one retry with a pre-broadcast error (refundable)", async () => {
+    const rpc = new FakeRpc();
+    const sender = build(rpc);
+    rpc.onSendRaw = () => rpc.rpcError("nonce too low");
+    const err = await sender.send(DEV1, 1n).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(SendError);
+    expect((err as SendError).phase).toBe("pre-broadcast");
+    expect(rpc.calls.filter((c) => c === "eth_sendRawTransaction")).toHaveLength(2);
+  });
+
+  it("two senders sharing one key alternate without a user-visible failure", async () => {
+    const rpc = new FakeRpc();
+    const a = build(rpc);
+    const b = build(rpc);
+    const stop = miner(rpc);
+    try {
+      for (let i = 0; i < 6; i++) {
+        const r = await (i % 2 === 0 ? a : b).send(DEV1, 1n);
+        expect(r.confirmed).toBe(true);
+        expect(rpc.mined.get(r.txHash)!.tx.nonce).toBe(i);
+      }
+    } finally {
+      stop();
+    }
+  });
+
+  it("drops the counter after a receipt wait times out, so an evicted tx leaves no nonce gap", async () => {
+    const rpc = new FakeRpc();
+    const sender = build(rpc, { confirmTimeoutMs: 40 });
+    const r = await sender.send(DEV1, 1n);
+    expect(r.confirmed).toBe(false);
+    // the node evicts it
+    rpc.pool = [];
+    const stop = miner(rpc);
+    try {
+      const r2 = await sender.send(DEV1, 1n);
+      expect(r2.confirmed).toBe(true);
+      expect(rpc.mined.get(r2.txHash)!.tx.nonce).toBe(0); // resynced, not 1
+      expect(rpc.calls.filter((c) => c === "eth_getTransactionCount")).toHaveLength(2);
     } finally {
       stop();
     }
@@ -110,10 +153,11 @@ describe("viem sender: broadcast failures", () => {
     }
   });
 
-  it("a timed-out broadcast whose tx the node accepted is NOT a failure: it is confirmed and the nonce moves on", async () => {
+  it("a timed-out broadcast whose tx the node accepted is NOT a failure: it is found once mined, confirmed, and the nonce moves on", async () => {
     const rpc = new FakeRpc();
     const sender = build(rpc);
-    // The node takes the tx but the response is lost (HIGH-1 repro).
+    // The node takes the tx but the response is lost (HIGH-1 repro). The
+    // hash lookup only answers after inclusion, so the poll window matters.
     rpc.onSendRaw = (_raw, tx) => {
       rpc.acceptTx(tx);
       rpc.timeout();
@@ -143,14 +187,47 @@ describe("viem sender: broadcast failures", () => {
     expect((err as SendError).phase).toBe("post-broadcast");
     expect((err as SendError).txHash).toMatch(/^0x[0-9a-f]{64}$/);
     expect((err as SendError).message).not.toMatch(/http/);
+    expect(rpc.calls.filter((c) => c === "eth_getTransactionByHash").length).toBeGreaterThan(2); // polled over the window
   });
 
-  it("'already known' is post-broadcast", async () => {
+  it("an immediate HTTP 502 from a proxy after the node took the tx is a success with a hash", async () => {
+    const rpc = new FakeRpc();
+    const sender = build(rpc);
+    rpc.onSendRaw = (_raw, tx) => {
+      rpc.acceptTx(tx);
+      rpc.http502();
+    };
+    const stop = miner(rpc);
+    try {
+      const r = await sender.send(DEV1, 1n);
+      expect(r.confirmed).toBe(true);
+      expect(rpc.calls.filter((c) => c === "eth_sendRawTransaction")).toHaveLength(1);
+    } finally {
+      stop();
+    }
+  });
+
+  it("'already known' with nothing to show for it is a stale counter: resync, retry, then refund", async () => {
     const rpc = new FakeRpc();
     const sender = build(rpc);
     rpc.onSendRaw = () => rpc.rpcError("already known");
     const err = await sender.send(DEV1, 1n).catch((e: unknown) => e);
-    expect((err as SendError).phase).toBe("post-broadcast");
+    expect((err as SendError).phase).toBe("pre-broadcast");
+    expect(rpc.calls.filter((c) => c === "eth_sendRawTransaction")).toHaveLength(2);
+    expect(rpc.calls).toContain("eth_getTransactionByHash");
+  });
+
+  it("'already known' is believed when the lookup finds the tx", async () => {
+    const rpc = new FakeRpc();
+    const sender = build(rpc);
+    rpc.onSendRaw = (_raw, tx) => {
+      rpc.acceptTx(tx);
+      rpc.mineBlock();
+      rpc.rpcError("already known");
+    };
+    const r = await sender.send(DEV1, 1n);
+    expect(r.confirmed).toBe(true);
+    expect(rpc.calls.filter((c) => c === "eth_sendRawTransaction")).toHaveLength(1);
   });
 
   it("the ante handler's refusal is pre-broadcast and reaches the caller verbatim", async () => {

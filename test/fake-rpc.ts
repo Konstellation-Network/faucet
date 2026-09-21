@@ -3,7 +3,7 @@
 // that only advances the pending nonce when a block is mined (as the
 // app-side mempool behaves), receipts, and hooks to break the broadcast.
 
-import { custom, keccak256, parseTransaction, RpcRequestError, TimeoutError, type Hex, type Transport } from "viem";
+import { custom, HttpRequestError, keccak256, parseTransaction, RpcRequestError, TimeoutError, type Hex, type Transport } from "viem";
 
 export interface PoolTx {
   hash: Hex;
@@ -150,15 +150,18 @@ export class FakeRpc {
         };
       }
       case "eth_getTransactionByHash": {
+        // As on the real node: with the app-side EVM mempool a queued tx is
+        // NOT visible by hash; only an included one is.
         const h = params[0] as Hex;
-        const tx = this.pool.find((p) => p.hash === h) ?? this.mined.get(h)?.tx;
-        if (!tx) return null;
+        const m = this.mined.get(h);
+        if (!m) return null;
+        const tx = m.tx;
         return {
           hash: tx.hash,
           nonce: hex(tx.nonce),
-          blockHash: null,
-          blockNumber: null,
-          transactionIndex: null,
+          blockHash: `0x${"11".repeat(32)}`,
+          blockNumber: hex(m.block),
+          transactionIndex: "0x0",
           from: `0x${"00".repeat(20)}`,
           to: tx.to ?? null,
           value: hex(tx.value),
@@ -197,5 +200,10 @@ export class FakeRpc {
 
   timeout(): never {
     throw new TimeoutError({ body: {}, url: "http://fake" });
+  }
+
+  /** An HTTP 5xx from a proxy in front of the node. */
+  http502(): never {
+    throw new HttpRequestError({ body: {}, url: "http://fake", status: 502, details: "Bad Gateway" });
   }
 }

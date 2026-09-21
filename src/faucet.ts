@@ -31,7 +31,17 @@ export interface FaucetRequest {
 
 export type FaucetResult =
   | { ok: true; txHash: `0x${string}`; confirmed: boolean; to: HexAddress; toBech32: string; amountKash: string; chainId: number }
-  | { ok: false; status: number; code: FaucetErrorCode; error: string; retryAfterSeconds?: number };
+  | {
+      ok: false;
+      status: number;
+      code: FaucetErrorCode;
+      error: string;
+      retryAfterSeconds?: number;
+      /** For send_failed: whether the payout provably did not happen. */
+      phase?: "pre-broadcast" | "post-broadcast";
+      /** For a post-broadcast failure: the hash to look for in the explorer. */
+      txHash?: `0x${string}`;
+    };
 
 export type FaucetErrorCode =
   | "invalid_address"
@@ -126,11 +136,28 @@ export class Faucet {
       };
     } catch (e) {
       const phase = e instanceof SendError ? e.phase : "post-broadcast";
-      if (phase === "pre-broadcast") await cooldown.release();
-      this.log("send failed", { to, ip: req.ip, phase, txHash: e instanceof SendError ? e.txHash : undefined, error: describe(e) });
-      // The chain's own refusal reasons (blocked recipient, frozen address —
-      // STATUS.md §3) are worth showing; the RPC URL and stack never are.
-      return { ok: false, status: 502, code: "send_failed", error: `send failed: ${describe(e).slice(0, 300)}` };
+      const txHash = e instanceof SendError ? e.txHash : undefined;
+      const reason = describe(e).slice(0, 300);
+      this.log("send failed", { to, ip: req.ip, phase, txHash, error: reason });
+      if (phase === "pre-broadcast") {
+        await cooldown.release();
+        // The chain's own refusal reasons (blocked recipient, frozen address —
+        // STATUS.md §3) are worth showing; the RPC URL and stack never are.
+        return { ok: false, status: 502, code: "send_failed", phase, error: `send failed: ${reason}` };
+      }
+      // The node may have taken the tx before the response was lost and the
+      // lookup window did not see it. Say so: the cooldown stands either way.
+      return {
+        ok: false,
+        status: 502,
+        code: "send_failed",
+        phase,
+        ...(txHash !== undefined ? { txHash } : {}),
+        error:
+          `the node did not answer the broadcast (${reason}); you may still have been paid` +
+          (txHash !== undefined ? ` — check the explorer for ${txHash}` : "") +
+          `. The cooldown stands.`,
+      };
     }
   }
 }

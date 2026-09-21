@@ -4,8 +4,8 @@
 //  - every 32-byte hex string, in any file, in any commit — unless it is
 //    exactly an allow-listed public value (the dev0 key from
 //    konstellation/local_node.sh), an obvious placeholder (four or fewer
-//    distinct hex digits, e.g. 0xabc000…), or a content digest written as
-//    `sha256:…` (the Dockerfile's base-image pin);
+//    distinct hex digits, e.g. 0xabc000…), or a `sha256:…` image digest on
+//    a Dockerfile `FROM` line (the base-image pin) — nowhere else;
 //  - any run of 12+ consecutive BIP-39 English words (a mnemonic), in any
 //    text file, in any commit.
 //
@@ -41,10 +41,15 @@ for (const commit of commits) {
     const text = buf.toString("utf8");
     const where = `${commit.slice(0, 8)}:${path}`;
 
+    const isDockerfile = /(^|\/)Dockerfile(\.[\w.-]+)?$/.test(path);
     const seenHere = new Set();
     for (const m of text.matchAll(/(?<![0-9a-fA-F])(sha256:|0x)?([0-9a-fA-F]{64})(?![0-9a-fA-F])/g)) {
       const hex = m[2].toLowerCase();
-      if (m[1] === "sha256:" || ALLOWED_HEX.has(hex) || seenHere.has(hex)) continue;
+      if (ALLOWED_HEX.has(hex) || seenHere.has(hex)) continue;
+      if (m[1] === "sha256:" && isDockerfile) {
+        const lineStart = text.lastIndexOf("\n", m.index) + 1;
+        if (/^\s*FROM\s/i.test(text.slice(lineStart, m.index))) continue;
+      }
       if (new Set(hex).size <= 4) continue; // placeholder
       seenHere.add(hex);
       findings.push(`${where}: 32-byte hex string ${hex.slice(0, 8)}…${hex.slice(-6)}`);

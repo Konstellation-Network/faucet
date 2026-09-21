@@ -79,6 +79,14 @@ describe("loadConfig", () => {
     expect(() => loadConfig({ ...base, TRUSTED_PROXY_HOPS: "0" })).toThrow(/between/);
   });
 
+  it("reads the lookup window and PUBLIC_ORIGIN", () => {
+    expect(loadConfig(base).lookupWindowMs).toBe(3_000);
+    expect(loadConfig(base).publicOrigin).toBeUndefined();
+    expect(loadConfig({ ...base, LOOKUP_WINDOW_SECONDS: "5", PUBLIC_ORIGIN: "https://Faucet.Example/" })).toMatchObject({ lookupWindowMs: 5_000, publicOrigin: "https://faucet.example" });
+    expect(() => loadConfig({ ...base, PUBLIC_ORIGIN: "faucet.example" })).toThrow(/PUBLIC_ORIGIN/);
+    expect(() => loadConfig({ ...base, PUBLIC_ORIGIN: "https://faucet.example/path" })).toThrow(/PUBLIC_ORIGIN/);
+  });
+
   it("never puts the RPC URL in the log description", () => {
     const c = loadConfig({ ...base, RPC_URL: "https://user:token@rpc.example/v1?key=abc" });
     const d = JSON.stringify(describeConfig(c));

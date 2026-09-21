@@ -8,17 +8,25 @@
 //   confirm    poll for the receipt                         — the node has it
 //
 // A `SendError` with `phase: "pre-broadcast"` means the payout provably did
-// not happen and the caller may refund the user's cooldown. Anything after
-// that is "post-broadcast": a timeout on the broadcast response, an HTTP 5xx,
-// "already known", "nonce too low" — all of which the PR #1 review turned
-// into repeat payouts by treating them as failures. Those keep the cooldown.
+// not happen and the caller may refund the user's cooldown. With the
+// broadcast never retried by the transport, a rejection the node *answered*
+// with is always pre-broadcast: nothing entered the pool. The only true
+// ambiguity is transport loss (timeout, connection error, HTTP 5xx) — the
+// node may have taken the tx before the response was lost. That is
+// "post-broadcast": the signed tx is looked up by hash for a couple of
+// block intervals (on this chain `eth_getTransactionByHash` only answers
+// after inclusion), a hit is a success, a miss keeps the cooldown (the
+// first PR #1 review turned these into repeat payouts).
 //
 // Nonces are a local counter, not `eth_getTransactionCount(pending)` per
 // send: with the app-side EVM mempool the pending count only moves when a
 // block lands, so two sends inside one block interval collided on the same
-// nonce (review HIGH-3). The counter is fetched once, advanced on every
-// successful broadcast, and resynced from the node after any nonce-related
-// or ambiguous error.
+// nonce (review HIGH-3). The counter goes stale whenever anything else
+// spends the key (a second replica, an operator's manual tx), so a
+// node-answered nonce complaint resyncs it and retries prepare+broadcast
+// once inside the same request; a second failure is a pre-broadcast error.
+// The counter is also dropped after a receipt wait times out (an evicted tx
+// would otherwise leave a nonce gap until restart).
 
 import {
   BaseError,
@@ -27,7 +35,6 @@ import {
   http,
   keccak256,
   RpcRequestError,
-  TransactionNotFoundError,
   TransactionReceiptNotFoundError,
   type Chain,
   type Hex,
@@ -99,18 +106,24 @@ export interface ViemSenderOptions {
   confirmTimeoutMs?: number;
   /** Receipt polling interval, ms. */
   pollIntervalMs?: number;
+  /** After a lost broadcast response: how long to look for the tx by hash, ms (≥ 2 block intervals). */
+  lookupWindowMs?: number;
   /** Test hook: replaces the HTTP transports (reads and the send alike). */
   transport?: Transport;
 }
 
-/** Any nonce complaint: the local counter is stale, resync it. */
+/** Any nonce complaint: the local counter is stale, resync it and retry once. */
 const NONCE_ERROR = /nonce too low|nonce too high|invalid nonce|already known|already exists|known transaction|replacement transaction underpriced|tx already in mempool/i;
-/** Complaints that mean *this or an earlier broadcast* is already in the pool — never refund on these. */
-const MAYBE_IN_POOL = /nonce too low|already known|already exists|known transaction|tx already in mempool/i;
+/** "This exact tx is already in the pool": only believed if a lookup finds the hash. */
+const ALREADY_KNOWN = /already known|already exists|known transaction|tx already in mempool/i;
 
-/** Strips anything that looks like a URL so the RPC endpoint (which may carry a token) never reaches a log or a user. */
+/**
+ * Strips anything that looks like a URL — http(s), redis://, anything with a
+ * scheme — so an endpoint carrying a token or password never reaches a log
+ * or a user. viem strips userinfo from its own messages, not path/query.
+ */
 export function redactUrls(s: string): string {
-  return s.replace(/https?:\/\/[^\s"']+/g, "<rpc>");
+  return s.replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>]+/gi, "<url>");
 }
 
 function firstLine(e: unknown): string {
@@ -132,6 +145,7 @@ export function createViemSender(opts: ViemSenderOptions): Sender {
   const timeout = opts.timeoutMs ?? 15_000;
   const confirmTimeoutMs = opts.confirmTimeoutMs ?? 20_000;
   const pollIntervalMs = opts.pollIntervalMs ?? 500;
+  const lookupWindowMs = opts.lookupWindowMs ?? 3_000;
   const account = privateKeyToAccount(opts.privateKey);
 
   // Reads may retry; the broadcast must not, or a 5xx replays the signed tx.
@@ -154,7 +168,11 @@ export function createViemSender(opts: ViemSenderOptions): Sender {
     return nextNonce;
   }
 
-  async function prepareAndBroadcast(to: HexAddress, valueWei: bigint): Promise<Hex> {
+  /**
+   * One attempt at prepare + broadcast. `attempt` > 0 means the nonce was
+   * just resynced after a node-answered nonce complaint.
+   */
+  async function prepareAndBroadcast(to: HexAddress, valueWei: bigint, attempt = 0): Promise<Hex> {
     // ---- prepare: any failure here is provably pre-broadcast ----
     let raw: Hex;
     let hash: Hex;
@@ -191,24 +209,30 @@ export function createViemSender(opts: ViemSenderOptions): Sender {
     } catch (e) {
       const rpc = rpcError(e);
       if (rpc !== null) {
-        if (NONCE_ERROR.test(rpc.message)) nextNonce = null;
-        if (!MAYBE_IN_POOL.test(rpc.message)) {
-          // The node answered and rejected it (ante refusal, insufficient
-          // funds, frozen address, stale nonce…): nothing entered the mempool.
-          throw new SendError("pre-broadcast", firstLine(rpc), hash, e);
+        // The node answered: this tx did not enter the pool.
+        if (ALREADY_KNOWN.test(rpc.message)) {
+          // …unless the node means it literally. Believe it only on sight.
+          const known = await pollLookup(hash);
+          if (known !== null) {
+            nextNonce = known + 1;
+            return hash;
+          }
         }
-      } else {
-        // Timeout, connection error, HTTP 5xx: the node may have accepted
-        // the tx before the response was lost.
-        nextNonce = null;
+        if (NONCE_ERROR.test(rpc.message)) {
+          nextNonce = null;
+          if (attempt === 0) return prepareAndBroadcast(to, valueWei, 1);
+        }
+        throw new SendError("pre-broadcast", firstLine(rpc), hash, e);
       }
-      // Look for the tx by hash before deciding what to tell the caller.
-      const known = await lookupTransaction(hash);
+      // Transport loss: the node may have taken the tx. Look for it by hash
+      // across a couple of block intervals before giving up.
+      nextNonce = null;
+      const known = await pollLookup(hash);
       if (known !== null) {
         nextNonce = known + 1;
         return hash;
       }
-      throw new SendError("post-broadcast", firstLine(rpc ?? e), hash, e);
+      throw new SendError("post-broadcast", firstLine(e), hash, e);
     }
   }
 
@@ -217,10 +241,26 @@ export function createViemSender(opts: ViemSenderOptions): Sender {
     try {
       const tx = await readClient.getTransaction({ hash });
       return tx.nonce;
-    } catch (e) {
-      if (e instanceof BaseError && e.walk((err) => err instanceof TransactionNotFoundError)) return null;
+    } catch {
       return null;
     }
+  }
+
+  /** lookupTransaction, repeated for `lookupWindowMs`. */
+  async function pollLookup(hash: Hex): Promise<number | null> {
+    const deadline = Date.now() + lookupWindowMs;
+    for (;;) {
+      const found = await lookupTransaction(hash);
+      if (found !== null) return found;
+      if (Date.now() >= deadline) return null;
+      await new Promise((r) => setTimeout(r, pollIntervalMs));
+    }
+  }
+
+  /** No receipt in time: the tx may be evicted, so the counter must not assume it. */
+  function unconfirmed(hash: Hex): SendResult {
+    nextNonce = null;
+    return { txHash: hash, confirmed: false };
   }
 
   async function waitForReceipt(hash: Hex): Promise<SendResult> {
@@ -235,10 +275,10 @@ export function createViemSender(opts: ViemSenderOptions): Sender {
         const notFound = e instanceof BaseError && e.walk((err) => err instanceof TransactionReceiptNotFoundError);
         if (!notFound) {
           // RPC trouble while polling: the tx is broadcast regardless.
-          if (Date.now() >= deadline) return { txHash: hash, confirmed: false };
+          if (Date.now() >= deadline) return unconfirmed(hash);
         }
       }
-      if (Date.now() >= deadline) return { txHash: hash, confirmed: false };
+      if (Date.now() >= deadline) return unconfirmed(hash);
       await new Promise((r) => setTimeout(r, pollIntervalMs));
     }
   }

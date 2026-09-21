@@ -9,7 +9,9 @@
 
 services:
   faucet:
-    build: .
+    build:
+      context: .
+      # args: { WITH_REDIS: "1" }   # only for the multi-replica (Redis) deployment
     restart: unless-stopped
     env_file: .env
     environment:
@@ -35,8 +37,8 @@ services:
       options: { max-size: "10m", max-file: "3" }
 
   # Optional: shared cooldown store for more than one faucet replica.
-  # Then set RATE_LIMIT_STORE=redis and REDIS_URL=redis://redis:6379 in .env;
-  # the redis client ships in the image as an optional dependency.
+  # Then set RATE_LIMIT_STORE=redis and REDIS_URL=redis://redis:6379 in .env
+  # and build with WITH_REDIS=1 (the default image leaves the client out).
   # redis:
   #   image: redis:7-alpine
   #   restart: unless-stopped

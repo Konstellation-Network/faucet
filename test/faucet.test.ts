@@ -121,6 +121,8 @@ describe("Faucet.request", () => {
     const r = await faucet.request({ address: DEV0, ip: "1.1.1.1" });
     expect(r).toMatchObject({ ok: false, status: 502, code: "send_failed" });
     expect((r as { error: string }).error).toBe("send failed: address is frozen");
+    expect(r).toMatchObject({ phase: "pre-broadcast" });
+    expect(r).not.toHaveProperty("txHash");
     // second attempt goes through: the claim was released
     expect((await faucet.request({ address: DEV0, ip: "1.1.1.1" })).ok).toBe(true);
   });
@@ -130,7 +132,10 @@ describe("Faucet.request", () => {
     const { faucet, store } = build({ sender });
     sender.failNext = new SendError("post-broadcast", "The request took too long to respond.", `0x${"ab".repeat(32)}`);
     const r = await faucet.request({ address: DEV0, ip: "1.1.1.1" });
-    expect(r).toMatchObject({ ok: false, status: 502, code: "send_failed" });
+    expect(r).toMatchObject({ ok: false, status: 502, code: "send_failed", phase: "post-broadcast", txHash: `0x${"ab".repeat(32)}` });
+    expect((r as { error: string }).error).toMatch(/may still have been paid/);
+    expect((r as { error: string }).error).toContain(`0x${"ab".repeat(32)}`);
+    expect((r as { error: string }).error).toMatch(/cooldown stands/);
     expect(store.size()).toBe(2);
     // the retry that drained the first version is now rate-limited
     expect(await faucet.request({ address: DEV0, ip: "1.1.1.1" })).toMatchObject({ status: 429 });

@@ -34,6 +34,10 @@ export interface FaucetConfig {
   trustedProxyHops: number;
   /** How long a request waits for the receipt before answering 202 "broadcast". */
   confirmTimeoutMs: number;
+  /** After a lost broadcast response: how long the sender looks for the tx by hash. */
+  lookupWindowMs: number;
+  /** The origin the page is served from, when the request Host does not say (behind a Host-rewriting proxy). */
+  publicOrigin: string | undefined;
   rateLimitStore: "memory" | "redis";
   redisUrl: string | undefined;
   captcha: {
@@ -137,6 +141,11 @@ export function loadConfig(env: Env = process.env): FaucetConfig {
     }
   }
 
+  const publicOrigin = env["PUBLIC_ORIGIN"]?.trim().replace(/\/+$/, "").toLowerCase() || undefined;
+  if (publicOrigin !== undefined && !/^https?:\/\/[^/\s]+$/.test(publicOrigin)) {
+    throw new ConfigError(`PUBLIC_ORIGIN must be an origin (scheme://host[:port], no path), got "${publicOrigin}"`);
+  }
+
   const rateLimitStore = str(env, "RATE_LIMIT_STORE", "memory");
   if (rateLimitStore !== "memory" && rateLimitStore !== "redis") {
     throw new ConfigError('RATE_LIMIT_STORE must be "memory" or "redis"');
@@ -179,6 +188,8 @@ export function loadConfig(env: Env = process.env): FaucetConfig {
     trustProxy: bool(env, "TRUST_PROXY", false),
     trustedProxyHops: int(env, "TRUSTED_PROXY_HOPS", 1, 1, 10),
     confirmTimeoutMs: int(env, "CONFIRM_TIMEOUT_SECONDS", 20, 1, 300) * 1000,
+    lookupWindowMs: int(env, "LOOKUP_WINDOW_SECONDS", 3, 1, 60) * 1000,
+    publicOrigin,
     rateLimitStore,
     redisUrl,
     captcha: { provider: captchaProvider, secret: captchaSecret, siteKey: captchaSiteKey },
@@ -206,6 +217,8 @@ export function describeConfig(c: FaucetConfig): Record<string, unknown> {
     trustProxy: c.trustProxy,
     trustedProxyHops: c.trustedProxyHops,
     confirmTimeoutMs: c.confirmTimeoutMs,
+    lookupWindowMs: c.lookupWindowMs,
+    publicOrigin: c.publicOrigin,
     rateLimitStore: c.rateLimitStore,
     captcha: c.captcha.provider,
     networkName: c.networkName,
