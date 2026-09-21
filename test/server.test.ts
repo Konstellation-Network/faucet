@@ -16,12 +16,14 @@ const KEY = "0x88cbead91aee890d27bf06e003ade3d4e952427e88f88d31d61d3ef5e5d54305"
 interface Harness {
   base: string;
   sent: string[];
-  state: { balance: bigint; maxFeePerGas: bigint; rpcDown: boolean; confirmed: boolean; statusCalls: number; failWith: Error | null };
+  state: { balance: bigint; maxFeePerGas: bigint; rpcDown: boolean; confirmed: boolean; statusCalls: number; failWith: Error | null; codeAt: Set<string> };
+  logs: string[];
   close(): Promise<void>;
 }
 
 async function harness(env: Record<string, string>, healthCacheMs = 0): Promise<Harness> {
-  const state = { balance: parseEther("5000"), maxFeePerGas: 0n, rpcDown: false, confirmed: true, statusCalls: 0, failWith: null as Error | null };
+  const state = { balance: parseEther("5000"), maxFeePerGas: 0n, rpcDown: false, confirmed: true, statusCalls: 0, failWith: null as Error | null, codeAt: new Set<string>() };
+  const logs: string[] = [];
   const sent: string[] = [];
   const sender: import("../src/sender.ts").Sender = {
     address: "0x40a0cb1C63e026A81B55EE1308586E21eec1eFa9",
@@ -34,13 +36,16 @@ async function harness(env: Record<string, string>, healthCacheMs = 0): Promise<
       sent.push(to);
       return { txHash: "0xabc0000000000000000000000000000000000000000000000000000000000000", confirmed: state.confirmed };
     },
+    async hasCode(address) {
+      return state.codeAt.has(address.toLowerCase());
+    },
     async status() {
       state.statusCalls++;
       if (state.rpcDown) throw new Error("ECONNREFUSED");
       return { chainId: 56670, blockNumber: 42n, faucetBalanceWei: state.balance, maxFeePerGas: state.maxFeePerGas };
     },
   };
-  const config = loadConfig({ FAUCET_PRIVATE_KEY: KEY, RPC_URL: "http://127.0.0.1:8545", CHAIN_ID: "56670", ...env });
+  const config = loadConfig({ FAUCET_PRIVATE_KEY: KEY, RPC_URL: "http://127.0.0.1:8545", CHAIN_ID: "56670", NODE_ENV: "development", ALLOW_NO_CAPTCHA: "true", ...env });
   const faucet = new Faucet({
     sender,
     store: new MemoryRateLimitStore(),
@@ -51,11 +56,11 @@ async function harness(env: Record<string, string>, healthCacheMs = 0): Promise<
     cooldownSeconds: config.cooldownSeconds,
     bech32Prefix: config.bech32Prefix,
   });
-  const handler = createApp({ config, faucet, sender, log: () => undefined, healthCacheMs });
+  const handler = createApp({ config, faucet, sender, log: (msg) => void logs.push(msg), healthCacheMs });
   const server: Server = createServer((req, res) => void handler(req, res));
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
   const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
-  return { base, sent, state, close: () => new Promise<void>((r) => server.close(() => r())) };
+  return { base, sent, state, logs, close: () => new Promise<void>((r) => server.close(() => r())) };
 }
 
 const JSON_CT = { "content-type": "application/json" };
@@ -65,7 +70,7 @@ const post = (base: string, body: unknown, headers: Record<string, string> = JSO
 describe("HTTP server (behind a proxy)", () => {
   let h: Harness;
   beforeAll(async () => {
-    h = await harness({ ALLOWED_ORIGINS: "https://good.example", TRUST_PROXY: "true" });
+    h = await harness({ ALLOWED_ORIGINS: "https://good.example", TRUST_PROXY: "true", TRUSTED_PROXY_CIDRS: "127.0.0.0/8, ::1" });
   });
   afterAll(() => h.close());
 
@@ -137,6 +142,15 @@ describe("HTTP server (behind a proxy)", () => {
     expect((await post(h.base, { address: DEV1 }, { ...JSON_CT, "x-forwarded-for": "203.0.113.9, not-an-ip" })).status).toBe(400);
     expect((await post(h.base, { address: DEV1 })).status).toBe(400); // TRUST_PROXY without the header
     expect(h.sent).toHaveLength(1);
+  });
+
+  it("refuses a recipient with code with 400 contract_recipient", async () => {
+    const contract = "0x0000000000000000000000000000000000009999";
+    h.state.codeAt.add(contract.toLowerCase());
+    const res = await post(h.base, { address: contract }, { ...JSON_CT, "x-forwarded-for": "203.0.113.99" });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ code: "contract_recipient" });
+    expect(h.sent).not.toContain(contract);
   });
 
   it("keys IPv6 by /64 and canonicalises v4-mapped forms", async () => {
@@ -245,6 +259,27 @@ describe("redactUrls", () => {
     expect(redactUrls("redis://:hunter2@redis:6379 down")).toBe("<url> down");
     expect(redactUrls('URL: "https://user:pw@h/p"')).toBe('URL: "<url>"');
     expect(redactUrls("no urls here 1:2")).toBe("no urls here 1:2");
+  });
+});
+
+describe("HTTP server (TRUST_PROXY, but the peer is not a trusted proxy)", () => {
+  let h: Harness;
+  beforeAll(async () => {
+    // loopback (the test client) is deliberately NOT in the CIDRs
+    h = await harness({ TRUST_PROXY: "true", TRUSTED_PROXY_CIDRS: "10.0.0.0/8" });
+  });
+  afterAll(() => h.close());
+
+  it("ignores X-Forwarded-For from an untrusted peer, keys on the peer, and logs once", async () => {
+    const A = "0x0000000000000000000000000000000000007771";
+    const B = "0x0000000000000000000000000000000000007772";
+    expect((await post(h.base, { address: A }, { ...JSON_CT, "x-forwarded-for": "198.51.100.1" })).status).toBe(200);
+    // a different spoofed XFF from the same socket peer is the same client
+    expect((await post(h.base, { address: B }, { ...JSON_CT, "x-forwarded-for": "198.51.100.2" })).status).toBe(429);
+    // and a garbage XFF is not a 400 either: it is simply ignored
+    expect((await post(h.base, { address: B }, { ...JSON_CT, "x-forwarded-for": "not-an-ip" })).status).toBe(429);
+    expect(h.sent).toEqual([A]);
+    expect(h.logs.filter((m) => m.includes("not in TRUSTED_PROXY_CIDRS"))).toHaveLength(1);
   });
 });
 

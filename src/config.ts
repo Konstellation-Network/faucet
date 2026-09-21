@@ -3,6 +3,7 @@
 // through FAUCET_PRIVATE_KEY (a Docker/Coolify secret in deployment).
 
 import { parseEther } from "viem";
+import { parseCidr, type Cidr } from "./ip.ts";
 
 export const MAINNET_CHAIN_ID = 5667; // ENGINEERING.md §1 — the faucet must never run here
 export const TESTNET_CHAIN_ID = 56671;
@@ -32,6 +33,8 @@ export interface FaucetConfig {
   trustProxy: boolean;
   /** With trustProxy: how many proxies append to X-Forwarded-For; the client is that many hops from the right. */
   trustedProxyHops: number;
+  /** With trustProxy: forwarded headers are honoured only when the socket peer is inside one of these. */
+  trustedProxyCidrs: Cidr[];
   /** How long a request waits for the receipt before answering 202 "broadcast". */
   confirmTimeoutMs: number;
   /** After a lost broadcast response: how long the sender looks for the tx by hash. */
@@ -45,6 +48,8 @@ export interface FaucetConfig {
     secret: string | undefined;
     siteKey: string | undefined;
   };
+  /** CAPTCHA_PROVIDER=off was explicitly allowed on a public-looking deployment. */
+  allowNoCaptcha: boolean;
   /** Public-facing text for the page. */
   networkName: string;
   explorerTxUrl: string | undefined;
@@ -146,13 +151,17 @@ export function loadConfig(env: Env = process.env): FaucetConfig {
     throw new ConfigError(`PUBLIC_ORIGIN must be an origin (scheme://host[:port], no path), got "${publicOrigin}"`);
   }
 
-  const rateLimitStore = str(env, "RATE_LIMIT_STORE", "memory");
-  if (rateLimitStore !== "memory" && rateLimitStore !== "redis") {
-    throw new ConfigError('RATE_LIMIT_STORE must be "memory" or "redis"');
+  const trustProxy = bool(env, "TRUST_PROXY", false);
+  const trustedProxyCidrs: Cidr[] = [];
+  for (const entry of (env["TRUSTED_PROXY_CIDRS"] ?? "").split(",").map((x) => x.trim()).filter((x) => x.length > 0)) {
+    const c = parseCidr(entry);
+    if (!c) throw new ConfigError(`TRUSTED_PROXY_CIDRS entry "${entry}" is not an IP or CIDR`);
+    trustedProxyCidrs.push(c);
   }
-  const redisUrl = env["REDIS_URL"]?.trim() || undefined;
-  if (rateLimitStore === "redis" && redisUrl === undefined) {
-    throw new ConfigError("REDIS_URL is required when RATE_LIMIT_STORE=redis");
+  if (trustProxy && trustedProxyCidrs.length === 0) {
+    // Without this, TRUST_PROXY on a directly reachable port makes the
+    // per-IP cooldown whatever the client writes into X-Forwarded-For.
+    throw new ConfigError("TRUST_PROXY=true requires TRUSTED_PROXY_CIDRS (the proxies' addresses, e.g. 10.0.0.0/8,172.16.0.0/12)");
   }
 
   const captchaProvider = str(env, "CAPTCHA_PROVIDER", "off");
@@ -164,6 +173,28 @@ export function loadConfig(env: Env = process.env): FaucetConfig {
   if (captchaProvider !== "off" && (captchaSecret === undefined || captchaSiteKey === undefined)) {
     throw new ConfigError("CAPTCHA_SECRET and CAPTCHA_SITE_KEY are required when CAPTCHA_PROVIDER is set");
   }
+  // The captcha is the only volumetric control (per-IP cooldowns are
+  // keyed by /64 for IPv6, which a hosting customer can rotate). Anything
+  // that looks like a public deployment must turn it on, or say out loud
+  // that it is not. NODE_ENV unset counts as production, as for CORS above.
+  const looksPublic = trustProxy || allowedOrigins.length > 0 || publicOrigin !== undefined || nodeEnv === "production";
+  const allowNoCaptcha = bool(env, "ALLOW_NO_CAPTCHA", false);
+  if (captchaProvider === "off" && looksPublic && !allowNoCaptcha) {
+    throw new ConfigError(
+      "CAPTCHA_PROVIDER=off on what looks like a public deployment (TRUST_PROXY, ALLOWED_ORIGINS, PUBLIC_ORIGIN or NODE_ENV=production). " +
+        "Set CAPTCHA_PROVIDER=hcaptcha|turnstile, or ALLOW_NO_CAPTCHA=true to run without one (not for a public faucet).",
+    );
+  }
+
+  const rateLimitStore = str(env, "RATE_LIMIT_STORE", "memory");
+  if (rateLimitStore !== "memory" && rateLimitStore !== "redis") {
+    throw new ConfigError('RATE_LIMIT_STORE must be "memory" or "redis"');
+  }
+  const redisUrl = env["REDIS_URL"]?.trim() || undefined;
+  if (rateLimitStore === "redis" && redisUrl === undefined) {
+    throw new ConfigError("REDIS_URL is required when RATE_LIMIT_STORE=redis");
+  }
+
 
   // Bech32 prefixes are lowercase by definition (BIP-173); accept any case
   // in the env but normalise, or "Kons" would reject every kons1… input and
@@ -185,14 +216,16 @@ export function loadConfig(env: Env = process.env): FaucetConfig {
     port,
     host,
     allowedOrigins,
-    trustProxy: bool(env, "TRUST_PROXY", false),
+    trustProxy,
     trustedProxyHops: int(env, "TRUSTED_PROXY_HOPS", 1, 1, 10),
+    trustedProxyCidrs,
     confirmTimeoutMs: int(env, "CONFIRM_TIMEOUT_SECONDS", 20, 1, 300) * 1000,
     lookupWindowMs: int(env, "LOOKUP_WINDOW_SECONDS", 3, 1, 60) * 1000,
     publicOrigin,
     rateLimitStore,
     redisUrl,
     captcha: { provider: captchaProvider, secret: captchaSecret, siteKey: captchaSiteKey },
+    allowNoCaptcha,
     networkName: str(env, "NETWORK_NAME", chainId === TESTNET_CHAIN_ID ? "testnet-1" : `chain ${chainId}`),
     explorerTxUrl: env["EXPLORER_TX_URL"]?.trim() || undefined,
   };
@@ -216,6 +249,7 @@ export function describeConfig(c: FaucetConfig): Record<string, unknown> {
     allowedOrigins: c.allowedOrigins,
     trustProxy: c.trustProxy,
     trustedProxyHops: c.trustedProxyHops,
+    trustedProxyCidrs: c.trustedProxyCidrs.map((x) => x.text),
     confirmTimeoutMs: c.confirmTimeoutMs,
     lookupWindowMs: c.lookupWindowMs,
     publicOrigin: c.publicOrigin,

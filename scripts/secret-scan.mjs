@@ -19,7 +19,8 @@ const ALLOWED_HEX = new Set([
   // dev0 from konstellation/local_node.sh — public, funds a local dev chain only
   "88cbead91aee890d27bf06e003ade3d4e952427e88f88d31d61d3ef5e5d54305",
 ]);
-const SKIP_PATHS = new Set(["package-lock.json"]);
+// Nothing is skipped: package-lock.json's integrity hashes are base64 and
+// its resolved URLs carry no 64-hex tokens, so it scans clean and stays in.
 const MNEMONIC_MIN_WORDS = 12;
 
 const git = (...args) => execFileSync("git", args, { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
@@ -34,7 +35,7 @@ for (const commit of commits) {
   for (const entry of entries) {
     const [meta, path] = entry.split("\t");
     const [, type, blob] = meta.split(/\s+/);
-    if (type !== "blob" || SKIP_PATHS.has(path) || seenBlobs.has(blob)) continue;
+    if (type !== "blob" || seenBlobs.has(blob)) continue;
     seenBlobs.add(blob);
     const buf = execFileSync("git", ["cat-file", "blob", blob], { maxBuffer: 64 * 1024 * 1024 });
     if (buf.includes(0)) continue; // binary

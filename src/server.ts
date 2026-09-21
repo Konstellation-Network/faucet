@@ -11,7 +11,7 @@ import { formatEther } from "viem";
 import { createCaptchaVerifier } from "./captcha.ts";
 import { ConfigError, describeConfig, loadConfig, type FaucetConfig } from "./config.ts";
 import { Faucet } from "./faucet.ts";
-import { canonicalIp, forwardedClientIp, type CanonicalIp } from "./ip.ts";
+import { canonicalIp, forwardedClientIp, ipInCidrs, type CanonicalIp } from "./ip.ts";
 import { APP_JS, contentSecurityPolicy, renderPage } from "./page.ts";
 import { MemoryRateLimitStore, RedisRateLimitStore, type RateLimitStore } from "./ratelimit.ts";
 import { createViemSender, payoutCost, redactUrls, type ChainStatus, type Sender } from "./sender.ts";
@@ -39,17 +39,27 @@ function json(res: ServerResponse, status: number, body: unknown, extraHeaders: 
   res.end(JSON.stringify(body));
 }
 
+export interface ClientIpResult {
+  ip: CanonicalIp | null;
+  /** TRUST_PROXY is on but the socket peer is not a trusted proxy: the peer itself was used. */
+  untrustedPeer?: CanonicalIp;
+}
+
 /**
- * Client IP: the socket peer, or — with TRUST_PROXY — the entry
- * `trustedProxyHops` from the right of X-Forwarded-For (proxies append the
- * peer; everything to the left is client-supplied). Null when the chosen
- * entry is not an IP address, which the caller turns into a 400.
+ * Client IP: the socket peer, or — with TRUST_PROXY *and the peer inside
+ * TRUSTED_PROXY_CIDRS* — the entry `trustedProxyHops` from the right of
+ * X-Forwarded-For (proxies append the peer; everything to the left is
+ * client-supplied). A peer outside the CIDRs is not a proxy, whatever it
+ * sends: its own address is used and the caller logs it. `ip` is null when
+ * the chosen entry is not an IP address, which becomes a 400.
  */
-export function clientIp(req: IncomingMessage, trustProxy: boolean, trustedProxyHops = 1): CanonicalIp | null {
-  if (trustProxy) {
-    return forwardedClientIp(req.headers["x-forwarded-for"], trustedProxyHops);
+export function clientIp(req: IncomingMessage, config: Pick<FaucetConfig, "trustProxy" | "trustedProxyHops" | "trustedProxyCidrs">): ClientIpResult {
+  const peer = canonicalIp(req.socket.remoteAddress ?? "");
+  if (!config.trustProxy) return { ip: peer };
+  if (peer && ipInCidrs(peer, config.trustedProxyCidrs)) {
+    return { ip: forwardedClientIp(req.headers["x-forwarded-for"], config.trustedProxyHops) };
   }
-  return canonicalIp(req.socket.remoteAddress ?? "");
+  return { ip: peer, ...(peer ? { untrustedPeer: peer } : {}) };
 }
 
 /**
@@ -120,6 +130,16 @@ export function createApp(deps: AppDeps): Handler {
     "x-content-type-options": "nosniff",
     "referrer-policy": "no-referrer",
     "x-frame-options": "DENY",
+  };
+
+  // TRUST_PROXY with a peer that is not in TRUSTED_PROXY_CIDRS is a
+  // misconfiguration (or a direct hit on the port): say so, once per peer.
+  const warnedPeers = new Set<string>();
+  const warnUntrustedPeer = (peer: string): void => {
+    if (warnedPeers.has(peer)) return;
+    if (warnedPeers.size >= 1000) warnedPeers.clear();
+    warnedPeers.add(peer);
+    log("warning: TRUST_PROXY is on but the peer is not in TRUSTED_PROXY_CIDRS; using the peer address and ignoring X-Forwarded-For", { peer });
   };
 
   // /healthz is unauthenticated and costs four RPC calls; one status per
@@ -215,7 +235,8 @@ export function createApp(deps: AppDeps): Handler {
         json(res, 403, { error: "origin not allowed", code: "forbidden_origin" }, hdrs);
         return;
       }
-      const ip = clientIp(req, config.trustProxy, config.trustedProxyHops);
+      const { ip, untrustedPeer } = clientIp(req, config);
+      if (untrustedPeer !== undefined) warnUntrustedPeer(untrustedPeer.address);
       if (ip === null) {
         json(res, 400, { error: "could not determine client address", code: "bad_request" }, hdrs);
         return;
@@ -306,6 +327,11 @@ export async function main(): Promise<void> {
   });
   if (status.faucetBalanceWei < config.lowBalanceWei) {
     log("warning: faucet balance is low", { faucetBalanceKash: formatEther(status.faucetBalanceWei) });
+  }
+  if (config.captcha.provider === "off") {
+    log("WARNING: no captcha — the per-IP cooldown is the only volumetric control; do not expose this instance publicly", {
+      allowNoCaptcha: config.allowNoCaptcha,
+    });
   }
 
   const store = await buildStore(config);

@@ -17,6 +17,8 @@ export interface CanonicalIp {
   /** Rate-limit key: the IPv4 address, or the IPv6 /64 as `a:b:c:d::/64`. */
   key: string;
   family: 4 | 6;
+  /** 4 or 16 raw bytes, for CIDR matching. */
+  bytes: Uint8Array;
 }
 
 function parseIPv4(s: string): number[] | null {
@@ -82,7 +84,7 @@ export function canonicalIp(raw: string): CanonicalIp | null {
     const v4 = parseIPv4(s);
     if (!v4) return null;
     const address = v4.join(".");
-    return { address, key: address, family: 4 };
+    return { address, key: address, family: 4, bytes: Uint8Array.from(v4) };
   }
   if (kind !== 6) return null;
 
@@ -92,15 +94,62 @@ export function canonicalIp(raw: string): CanonicalIp | null {
   if (groups.slice(0, 5).every((g) => g === 0) && groups[5] === 0xffff) {
     const a = groups[6]!;
     const b = groups[7]!;
-    const address = `${a >> 8}.${a & 0xff}.${b >> 8}.${b & 0xff}`;
-    return { address, key: address, family: 4 };
+    const v4 = [a >> 8, a & 0xff, b >> 8, b & 0xff];
+    const address = v4.join(".");
+    return { address, key: address, family: 4, bytes: Uint8Array.from(v4) };
   }
   const hex = groups.map((g) => g.toString(16));
+  const bytes = new Uint8Array(16);
+  groups.forEach((g, i) => {
+    bytes[2 * i] = g >> 8;
+    bytes[2 * i + 1] = g & 0xff;
+  });
   return {
     address: hex.join(":"),
     key: `${hex.slice(0, 4).join(":")}::/64`,
     family: 6,
+    bytes,
   };
+}
+
+export interface Cidr {
+  family: 4 | 6;
+  bytes: Uint8Array;
+  prefix: number;
+  text: string;
+}
+
+/** Parses `a.b.c.d/n` or `x::y/n` (a bare address is a /32 or /128). Null if malformed. */
+export function parseCidr(raw: string): Cidr | null {
+  const s = raw.trim();
+  const slash = s.lastIndexOf("/");
+  const addr = canonicalIp(slash === -1 ? s : s.slice(0, slash));
+  if (!addr) return null;
+  const max = addr.family === 4 ? 32 : 128;
+  let prefix = max;
+  if (slash !== -1) {
+    const p = s.slice(slash + 1);
+    if (!/^\d{1,3}$/.test(p)) return null;
+    prefix = Number(p);
+    if (prefix > max) return null;
+  }
+  return { family: addr.family, bytes: addr.bytes, prefix, text: `${addr.address}/${prefix}` };
+}
+
+export function ipInCidr(ip: CanonicalIp, cidr: Cidr): boolean {
+  if (ip.family !== cidr.family) return false;
+  let bits = cidr.prefix;
+  for (let i = 0; i < ip.bytes.length && bits > 0; i++) {
+    const take = Math.min(8, bits);
+    const mask = (0xff << (8 - take)) & 0xff;
+    if ((ip.bytes[i]! & mask) !== (cidr.bytes[i]! & mask)) return false;
+    bits -= take;
+  }
+  return true;
+}
+
+export function ipInCidrs(ip: CanonicalIp, cidrs: readonly Cidr[]): boolean {
+  return cidrs.some((c) => ipInCidr(ip, c));
 }
 
 /**

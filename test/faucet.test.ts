@@ -16,6 +16,8 @@ interface MockSender extends Sender {
   failNext: Error | null;
   statusFails: boolean;
   confirmed: boolean;
+  codeAt: Set<string>;
+  codeFails: boolean;
 }
 
 function mockSender(balance = parseEther("1000")): MockSender {
@@ -27,6 +29,12 @@ function mockSender(balance = parseEther("1000")): MockSender {
     failNext: null,
     statusFails: false,
     confirmed: true,
+    codeAt: new Set<string>(),
+    codeFails: false,
+    async hasCode(address) {
+      if (s.codeFails) throw new Error("ECONNREFUSED http://rpc.internal:8545");
+      return s.codeAt.has(address.toLowerCase());
+    },
     async send(to, value) {
       if (s.failNext) {
         const e = s.failNext;
@@ -95,6 +103,25 @@ describe("Faucet.request", () => {
       expect(r).toMatchObject({ ok: false, status: 400, code: "blocked_recipient" });
     }
     expect(sender.sent).toHaveLength(0);
+  });
+
+  it("refuses recipients with code before any claim, and fails closed when getCode fails", async () => {
+    const sender = mockSender();
+    sender.codeAt.add(DEV1.toLowerCase());
+    const { faucet, store } = build({ sender });
+    const r = await faucet.request({ address: DEV1, ip: "1.1.1.1" });
+    expect(r).toMatchObject({ ok: false, status: 400, code: "contract_recipient" });
+    expect((r as { error: string }).error).toMatch(/has code/);
+    expect(store.size()).toBe(0);
+    expect(sender.sent).toHaveLength(0);
+
+    sender.codeFails = true;
+    const r2 = await faucet.request({ address: DEV0, ip: "1.1.1.1" });
+    expect(r2).toMatchObject({ ok: false, status: 502, code: "send_failed", phase: "pre-broadcast" });
+    expect(JSON.stringify(r2)).not.toContain("rpc.internal");
+    expect(store.size()).toBe(0);
+    sender.codeFails = false;
+    expect((await faucet.request({ address: DEV0, ip: "1.1.1.1" })).ok).toBe(true);
   });
 
   it("enforces the per-address cooldown", async () => {

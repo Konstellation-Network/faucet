@@ -40,6 +40,7 @@ describe("viem sender: fees", () => {
       expect(tx.maxFeePerGas).toBe((parseGwei("10") * 120n) / 100n + parseGwei("2"));
       expect(tx.gas).toBe(TRANSFER_GAS);
       expect(rpc.calls).toContain("eth_maxPriorityFeePerGas");
+      expect(rpc.calls).not.toContain("eth_estimateGas");
 
       const s = await sender.status();
       expect(s.maxFeePerGas).toBe(tx.maxFeePerGas);
@@ -237,6 +238,30 @@ describe("viem sender: broadcast failures", () => {
     const err = await sender.send(DEV1, 1n).catch((e: unknown) => e);
     expect((err as SendError).phase).toBe("pre-broadcast");
     expect((err as SendError).message).toMatch(/fee_collector/);
+  });
+});
+
+describe("viem sender: recipients", () => {
+  it("always signs with the 21 000 gas limit, whatever the recipient", async () => {
+    const rpc = new FakeRpc();
+    rpc.code.set(DEV1.toLowerCase(), "0x6110005b8015601057600190036003565b00"); // a gas burner
+    const sender = build(rpc);
+    const stop = miner(rpc);
+    try {
+      const r = await sender.send(DEV1, 1n);
+      expect(rpc.mined.get(r.txHash)!.tx.gas).toBe(TRANSFER_GAS);
+      expect(rpc.calls).not.toContain("eth_estimateGas");
+    } finally {
+      stop();
+    }
+  });
+
+  it("hasCode reports contracts and EIP-7702 delegations, not plain accounts", async () => {
+    const rpc = new FakeRpc();
+    rpc.code.set(DEV1.toLowerCase(), "0xef0100c6fe5d33615a1c52c08018c47e8bc53646a0e101");
+    const sender = build(rpc);
+    expect(await sender.hasCode(DEV1)).toBe(true);
+    expect(await sender.hasCode("0xC6Fe5D33615a1C52c08018c47E8Bc53646A0E101")).toBe(false);
   });
 });
 

@@ -43,7 +43,13 @@ import {
 import { privateKeyToAccount } from "viem/accounts";
 import type { HexAddress } from "./address.ts";
 
-/** Gas for a plain value transfer to an EOA; used for the affordability check. */
+/**
+ * Gas for a plain value transfer to an EOA. The faucet only ever does value
+ * transfers to accounts without code, so this is also the gas *limit* it
+ * signs with — never `estimateGas`: a recipient with a gas-burning receive()
+ * was paid at 9× that (adversarial review), and a malicious one would spend
+ * the bucket in gas and stall the queue.
+ */
 export const TRANSFER_GAS = 21_000n;
 
 export interface ChainStatus {
@@ -76,9 +82,11 @@ export class SendError extends Error {
 
 export interface Sender {
   readonly address: HexAddress;
-  /** Sends `valueWei` to `to` as an EIP-1559 transaction. Throws SendError. */
+  /** Sends `valueWei` to `to` as an EIP-1559 transaction with a 21 000 gas limit. Throws SendError. */
   send(to: HexAddress, valueWei: bigint): Promise<SendResult>;
   status(): Promise<ChainStatus>;
+  /** true if `address` has code (a contract, or an EIP-7702-delegated EOA — `0xef0100‖addr`). */
+  hasCode(address: HexAddress): Promise<boolean>;
 }
 
 /** Cost of one payout including gas at the quoted fee. */
@@ -178,9 +186,8 @@ export function createViemSender(opts: ViemSenderOptions): Sender {
     let hash: Hex;
     let nonce: number;
     try {
-      const [fees, gas, n] = await Promise.all([
+      const [fees, n] = await Promise.all([
         readClient.estimateFeesPerGas({ type: "eip1559" }),
-        readClient.estimateGas({ account: account.address, to, value: valueWei }),
         nextNonce === null ? syncNonce() : Promise.resolve(nextNonce),
       ]);
       nonce = n;
@@ -190,7 +197,7 @@ export function createViemSender(opts: ViemSenderOptions): Sender {
         to,
         value: valueWei,
         nonce,
-        gas,
+        gas: TRANSFER_GAS,
         maxFeePerGas: fees.maxFeePerGas,
         maxPriorityFeePerGas: fees.maxPriorityFeePerGas,
       });
@@ -291,6 +298,11 @@ export function createViemSender(opts: ViemSenderOptions): Sender {
       const broadcast = queue.then(run, run);
       queue = broadcast.catch(() => undefined);
       return broadcast.then(waitForReceipt);
+    },
+
+    async hasCode(address) {
+      const code = await readClient.getCode({ address });
+      return code !== undefined && code !== "0x";
     },
 
     async status() {

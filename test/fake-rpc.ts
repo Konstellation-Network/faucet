@@ -39,6 +39,8 @@ export class FakeRpc {
   onSendRaw: ((raw: Hex, tx: PoolTx) => Hex | Promise<Hex>) | null = null;
   /** Txs that revert when mined. */
   revertHashes = new Set<Hex>();
+  /** Accounts with code (lower-cased address → bytecode). */
+  code = new Map<string, Hex>();
 
   constructor(o: FakeRpcOptions = {}) {
     this.chainId = o.chainId ?? 56670;
@@ -117,7 +119,9 @@ export class FakeRpc {
           mixHash: `0x${"77".repeat(32)}`,
         };
       case "eth_estimateGas":
-        return "0x5208";
+        throw new Error("fake rpc: the faucet must not estimate gas");
+      case "eth_getCode":
+        return this.code.get((params[0] as string).toLowerCase()) ?? "0x";
       case "eth_getTransactionCount": {
         // `pending` == `latest` until a block lands: the app-side mempool does
         // not advance the pending nonce for queued txs.

@@ -46,6 +46,7 @@ export type FaucetResult =
 export type FaucetErrorCode =
   | "invalid_address"
   | "blocked_recipient"
+  | "contract_recipient"
   | "captcha_failed"
   | "rate_limited"
   | "faucet_empty"
@@ -80,6 +81,24 @@ export class Faucet {
     }
     if (to.toLowerCase() === this.opts.sender.address.toLowerCase()) {
       return { ok: false, status: 400, code: "blocked_recipient", error: "that is the faucet's own address" };
+    }
+
+    // Only accounts without code: the payout is signed with a 21 000 gas
+    // limit, so a contract's receive() would revert it — and one that did
+    // not would decide how much gas the faucet burns. Checked before any
+    // claim, so it costs the user nothing.
+    try {
+      if (await this.opts.sender.hasCode(to)) {
+        return {
+          ok: false,
+          status: 400,
+          code: "contract_recipient",
+          error: `${to} has code (a contract or a delegated account); the faucet only sends to plain accounts`,
+        };
+      }
+    } catch (e) {
+      this.log("getCode failed", { to, ip: req.ip, error: describe(e) });
+      return { ok: false, status: 502, code: "send_failed", phase: "pre-broadcast", error: "send failed: the node did not answer" };
     }
 
     if (!(await this.opts.captcha.verify(typeof req.captchaToken === "string" ? req.captchaToken : undefined, req.clientAddress ?? req.ip))) {

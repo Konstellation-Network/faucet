@@ -3,7 +3,8 @@ import { parseEther } from "viem";
 import { ConfigError, describeConfig, loadConfig } from "../src/config.ts";
 
 const KEY = "0x88cbead91aee890d27bf06e003ade3d4e952427e88f88d31d61d3ef5e5d54305"; // dev0, public
-const base = { FAUCET_PRIVATE_KEY: KEY, RPC_URL: "http://127.0.0.1:8545" };
+const base = { FAUCET_PRIVATE_KEY: KEY, RPC_URL: "http://127.0.0.1:8545", NODE_ENV: "development" };
+const CIDRS = { TRUSTED_PROXY_CIDRS: "10.0.0.0/8" };
 
 describe("loadConfig", () => {
   it("applies the documented defaults", () => {
@@ -46,14 +47,14 @@ describe("loadConfig", () => {
   });
 
   it("refuses wildcard CORS outside development", () => {
-    expect(() => loadConfig({ ...base, ALLOWED_ORIGINS: "*" })).toThrow(/NODE_ENV=development/);
+    expect(() => loadConfig({ ...base, ALLOWED_ORIGINS: "*", NODE_ENV: "" })).toThrow(/NODE_ENV=development/);
     expect(() => loadConfig({ ...base, ALLOWED_ORIGINS: "*", NODE_ENV: "production" })).toThrow(ConfigError);
-    expect(loadConfig({ ...base, ALLOWED_ORIGINS: "*", NODE_ENV: "development" }).allowedOrigins).toEqual(["*"]);
-    expect(loadConfig({ ...base, ALLOWED_ORIGINS: "https://faucet.example, https://docs.example:8443" }).allowedOrigins).toEqual([
+    expect(loadConfig({ ...base, ALLOWED_ORIGINS: "*", NODE_ENV: "development", ALLOW_NO_CAPTCHA: "true" }).allowedOrigins).toEqual(["*"]);
+    expect(loadConfig({ ...base, ALLOW_NO_CAPTCHA: "true", ALLOWED_ORIGINS: "https://faucet.example, https://docs.example:8443" }).allowedOrigins).toEqual([
       "https://faucet.example",
       "https://docs.example:8443",
     ]);
-    expect(() => loadConfig({ ...base, ALLOWED_ORIGINS: "https://a.example/path" })).toThrow(/origin/);
+    expect(() => loadConfig({ ...base, ALLOW_NO_CAPTCHA: "true", ALLOWED_ORIGINS: "https://a.example/path" })).toThrow(/origin/);
   });
 
   it("validates the captcha and redis settings", () => {
@@ -76,15 +77,17 @@ describe("loadConfig", () => {
     expect(loadConfig(base).trustedProxyHops).toBe(1);
     expect(loadConfig(base).confirmTimeoutMs).toBe(20_000);
     expect(loadConfig({ ...base, TRUSTED_PROXY_HOPS: "2", CONFIRM_TIMEOUT_SECONDS: "5" })).toMatchObject({ trustedProxyHops: 2, confirmTimeoutMs: 5_000 });
+    expect(loadConfig({ ...base, TRUST_PROXY: "true", ...CIDRS, ALLOW_NO_CAPTCHA: "true" }).trustedProxyCidrs.map((c) => c.text)).toEqual(["10.0.0.0/8"]);
     expect(() => loadConfig({ ...base, TRUSTED_PROXY_HOPS: "0" })).toThrow(/between/);
   });
 
   it("reads the lookup window and PUBLIC_ORIGIN", () => {
     expect(loadConfig(base).lookupWindowMs).toBe(3_000);
     expect(loadConfig(base).publicOrigin).toBeUndefined();
-    expect(loadConfig({ ...base, LOOKUP_WINDOW_SECONDS: "5", PUBLIC_ORIGIN: "https://Faucet.Example/" })).toMatchObject({ lookupWindowMs: 5_000, publicOrigin: "https://faucet.example" });
-    expect(() => loadConfig({ ...base, PUBLIC_ORIGIN: "faucet.example" })).toThrow(/PUBLIC_ORIGIN/);
-    expect(() => loadConfig({ ...base, PUBLIC_ORIGIN: "https://faucet.example/path" })).toThrow(/PUBLIC_ORIGIN/);
+    const ok = { ...base, ALLOW_NO_CAPTCHA: "true" };
+    expect(loadConfig({ ...ok, LOOKUP_WINDOW_SECONDS: "5", PUBLIC_ORIGIN: "https://Faucet.Example/" })).toMatchObject({ lookupWindowMs: 5_000, publicOrigin: "https://faucet.example" });
+    expect(() => loadConfig({ ...ok, PUBLIC_ORIGIN: "faucet.example" })).toThrow(/PUBLIC_ORIGIN/);
+    expect(() => loadConfig({ ...ok, PUBLIC_ORIGIN: "https://faucet.example/path" })).toThrow(/PUBLIC_ORIGIN/);
   });
 
   it("never puts the RPC URL in the log description", () => {
@@ -93,6 +96,33 @@ describe("loadConfig", () => {
     expect(d).not.toContain("token");
     expect(d).not.toContain("key=abc");
     expect(d).toContain("rpc.example");
+  });
+
+  it("requires TRUSTED_PROXY_CIDRS with TRUST_PROXY and validates them", () => {
+    expect(() => loadConfig({ ...base, TRUST_PROXY: "true", ALLOW_NO_CAPTCHA: "true" })).toThrow(/TRUSTED_PROXY_CIDRS/);
+    expect(() => loadConfig({ ...base, TRUST_PROXY: "true", ALLOW_NO_CAPTCHA: "true", TRUSTED_PROXY_CIDRS: "10.0.0.0/33" })).toThrow(/not an IP or CIDR/);
+    expect(() => loadConfig({ ...base, TRUST_PROXY: "true", ALLOW_NO_CAPTCHA: "true", TRUSTED_PROXY_CIDRS: "proxy" })).toThrow(/not an IP or CIDR/);
+    const c = loadConfig({ ...base, TRUST_PROXY: "true", ALLOW_NO_CAPTCHA: "true", TRUSTED_PROXY_CIDRS: " 172.16.0.0/12, 2001:db8::/32 ,192.0.2.7" });
+    expect(c.trustedProxyCidrs.map((x) => x.text)).toEqual(["172.16.0.0/12", "2001:db8:0:0:0:0:0:0/32", "192.0.2.7/32"]);
+    // CIDRs without TRUST_PROXY are accepted and unused
+    expect(loadConfig({ ...base, ...CIDRS }).trustProxy).toBe(false);
+  });
+
+  it("refuses CAPTCHA_PROVIDER=off on a public-looking deployment unless ALLOW_NO_CAPTCHA", () => {
+    const captcha = { CAPTCHA_PROVIDER: "turnstile", CAPTCHA_SECRET: "s", CAPTCHA_SITE_KEY: "k" };
+    const noEnv = { FAUCET_PRIVATE_KEY: KEY, RPC_URL: base.RPC_URL };
+    for (const pub of [
+      { NODE_ENV: "production" },
+      {}, // unset counts as production
+      { NODE_ENV: "development", TRUST_PROXY: "true", ...CIDRS },
+      { NODE_ENV: "development", ALLOWED_ORIGINS: "https://docs.example" },
+      { NODE_ENV: "development", PUBLIC_ORIGIN: "https://faucet.example" },
+    ]) {
+      expect(() => loadConfig({ ...noEnv, ...pub })).toThrow(/CAPTCHA_PROVIDER=off/);
+      expect(loadConfig({ ...noEnv, ...pub, ALLOW_NO_CAPTCHA: "true" })).toMatchObject({ allowNoCaptcha: true });
+      expect(loadConfig({ ...noEnv, ...pub, ...captcha }).captcha.provider).toBe("turnstile");
+    }
+    expect(loadConfig(base).allowNoCaptcha).toBe(false); // plain development needs nothing
   });
 
   it("bounds integers", () => {
