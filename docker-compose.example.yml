@@ -1,0 +1,53 @@
+# Example deployment. Copy to docker-compose.yml (git-ignored) and fill in.
+# The key comes from the environment / a secrets file, never from this repo.
+#
+#   cp .env.example .env && $EDITOR .env      # set FAUCET_PRIVATE_KEY, RPC_URL, ...
+#   docker compose -f docker-compose.example.yml up -d --build
+#
+# Testnet-only (ENGINEERING.md §18): there is no faucet on konstellation-1 and
+# the service refuses CHAIN_ID=5667 at startup.
+
+services:
+  faucet:
+    build:
+      context: .
+      # args: { WITH_REDIS: "1" }   # only for the multi-replica (Redis) deployment
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      PORT: "8080"
+      # Clients hit the container directly (the port binding below): the
+      # socket peer is the client, X-Forwarded-For is ignored.
+      TRUST_PROXY: "false"
+      # Behind a reverse proxy (Coolify, Traefik, nginx) that appends the peer
+      # to X-Forwarded-For, enable all three. Forwarded headers are honoured
+      # only when the socket peer is inside TRUSTED_PROXY_CIDRS; any other
+      # peer is treated as the client and a warning is logged.
+      # TRUST_PROXY: "true"
+      # TRUSTED_PROXY_CIDRS: "172.16.0.0/12"   # the proxy's network
+      # TRUSTED_PROXY_HOPS: "1"
+      # A public faucet needs a captcha (the service refuses to start
+      # without one when TRUST_PROXY/ALLOWED_ORIGINS/PUBLIC_ORIGIN are set or
+      # NODE_ENV=production, unless ALLOW_NO_CAPTCHA=true).
+      # CAPTCHA_PROVIDER: turnstile
+    ports:
+      - "127.0.0.1:8080:8080"
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 256m
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  # Optional: shared cooldown store for more than one faucet replica.
+  # Then set RATE_LIMIT_STORE=redis and REDIS_URL=redis://redis:6379 in .env
+  # and build with WITH_REDIS=1 (the default image leaves the client out).
+  # redis:
+  #   image: redis:7-alpine
+  #   restart: unless-stopped
+  #   command: ["redis-server", "--save", "", "--appendonly", "no"]

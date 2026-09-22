@@ -1,0 +1,31 @@
+{
+  "name": "@konstellation-network/faucet",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Konstellation testnet-1 KASH faucet (testnet-only, ENGINEERING.md §18)",
+  "license": "Apache-2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "main": "dist/main.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/main.js",
+    "dev": "node --env-file-if-exists=.env --experimental-strip-types src/main.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "viem": "2.56.8"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.4",
+    "typescript": "5.9.3",
+    "vitest": "4.1.11"
+  },
+  "optionalDependencies": {
+    "redis": "6.2.1"
+  }
+}
