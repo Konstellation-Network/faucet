@@ -1,13 +1,25 @@
 # faucet
 
-Token faucet for **Konstellation testnet-1**. Sends a fixed amount of test KASH
-to an address, once per address and once per IP per cooldown.
+Token faucet for the Konstellation test networks. Sends a fixed amount of test
+KASH to an address, once per address and once per IP per cooldown.
 
-**Testnet-only.** `ENGINEERING.md §18`: "Faucet — required (`faucet` repo) /
-does not exist on mainnet". The service refuses to start with `CHAIN_ID=5667`
-(konstellation-1). The account it spends from is the testnet "liquidity"
-bucket of the genesis allocation (`TOKENOMICS.md §7`, `ENGINEERING.md §18`),
-which on testnet-1 is a test address with no value behind it.
+**Which network.** There are two faucet deployments, one per network, from the
+same code (decided 2026-09-29):
+
+| Network | `CHAIN_ID` | Role |
+|---|---|---|
+| **devnet-1** | `56672` (default) | **the primary faucet** — devnet-1 is where dapp developers start: one foundation-run validator, same release as mainnet, rarely reset |
+| testnet-1 | `56671` | validator/operations rehearsal network (upgrade drills, chaos tests, D16 admissions); new releases land here first and it may be disrupted. Kept for operators and anyone rehearsing an upgrade |
+
+Point dapp developers at the devnet-1 faucet. Each deployment has its own
+key, funded by its own network's genesis allocation.
+
+**Never on mainnet.** `ENGINEERING.md §18`: "Faucet — required (`faucet`
+repo) / does not exist on mainnet". The service refuses to start with
+`CHAIN_ID=5667` (konstellation-1). The account it spends from is the
+"liquidity" bucket of that network's genesis allocation (`TOKENOMICS.md §7`,
+`ENGINEERING.md §18`), which on devnet-1 and testnet-1 is a test address with
+no value behind it.
 
 This repo is a service, not a binary: `konstellation` is the only repo that
 produces an executable (`ENGINEERING.md §5`). It ships as TypeScript run by
@@ -89,14 +101,14 @@ that matter:
 | Variable | Default | |
 |---|---|---|
 | `FAUCET_PRIVATE_KEY` | — (required) | 32-byte hex. **Secret. Never in a file in this repo.** |
-| `RPC_URL` | — (required) | Ethereum JSON-RPC of a testnet-1 RPC node |
-| `CHAIN_ID` | `56671` | testnet-1. `56670` = local dev chain. `5667` refused. Startup also checks `eth_chainId` against it and refuses to start on a mismatch. |
-| `AMOUNT_KASH` | `10` | **placeholder** until a testnet-1 payout policy is decided. Hard-capped at 1 000 by the service. |
+| `RPC_URL` | — (required) | Ethereum JSON-RPC of an RPC node on the faucet's network (devnet-1 or testnet-1) |
+| `CHAIN_ID` | `56672` | devnet-1 (the primary faucet). `56671` = testnet-1, `56670` = local dev chain. `5667` refused. Startup also checks `eth_chainId` against it and refuses to start on a mismatch. |
+| `AMOUNT_KASH` | `10` | **placeholder** until a devnet-1 / testnet-1 payout policy is decided. Hard-capped at 1 000 by the service. |
 | `COOLDOWN_SECONDS` | `86400` | per address *and* per IP |
 | `LOW_BALANCE_KASH` | `100 × AMOUNT_KASH` | `/healthz` reports `degraded` below this |
 | `PORT` / `HOST` | `8080` / `0.0.0.0` | |
 | `ALLOWED_ORIGINS` | empty | comma-separated origins for cross-origin API calls. The built-in page is same-origin and needs none. A `POST` carrying any other `Origin` is refused (403). `*` is refused unless `NODE_ENV=development`. |
-| `PUBLIC_ORIGIN` | — | the origin the page is served from, e.g. `https://faucet.testnet-1.konstellation.network`. Needed only when the proxy rewrites `Host` and does not send `X-Forwarded-Host` (with `TRUST_PROXY` the first `X-Forwarded-Host` entry is also accepted); otherwise "own origin" is judged by the request `Host`. |
+| `PUBLIC_ORIGIN` | — | the origin the page is served from, e.g. `https://faucet.devnet-1.konstellation.network`. Needed only when the proxy rewrites `Host` and does not send `X-Forwarded-Host` (with `TRUST_PROXY` the first `X-Forwarded-Host` entry is also accepted); otherwise "own origin" is judged by the request `Host`. |
 | `TRUST_PROXY` | `false` | take the client IP from `X-Forwarded-For` — but only for connections whose socket peer is inside `TRUSTED_PROXY_CIDRS`. Any other peer is treated as the client itself and a warning is logged once per peer, so a directly reachable port cannot be spoofed. |
 | `TRUSTED_PROXY_CIDRS` | — (required with `TRUST_PROXY`) | comma-separated IPs/CIDRs of the proxies, e.g. `172.16.0.0/12`. Startup refuses `TRUST_PROXY=true` without it. |
 | `TRUSTED_PROXY_HOPS` | `1` | how many proxies append to `X-Forwarded-For`; the client is that many entries from the *right* (everything further left is client-supplied and ignored). A non-IP in that slot is a 400. |
@@ -161,7 +173,7 @@ sentry.
 
 Checklist before it is public:
 
-- [ ] a dedicated faucet key, funded from the testnet liquidity bucket
+- [ ] a dedicated faucet key **per network** (devnet-1, testnet-1), each funded from that network's liquidity bucket
 - [ ] `CAPTCHA_PROVIDER` on, keys set (the service will not start publicly without it)
 - [ ] `TRUST_PROXY=true` only if the proxy sets `X-Forwarded-For`, with `TRUSTED_PROXY_CIDRS` = the proxy's addresses and `TRUSTED_PROXY_HOPS` = the number of proxies in front; `PUBLIC_ORIGIN` if it rewrites `Host` without `X-Forwarded-Host`
 - [ ] `ALLOWED_ORIGINS` set only if `docs` or another site will call the API directly
