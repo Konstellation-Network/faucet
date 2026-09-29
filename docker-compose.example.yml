@@ -4,8 +4,9 @@
 #   cp .env.example .env && $EDITOR .env      # set FAUCET_PRIVATE_KEY, RPC_URL, ...
 #   docker compose -f docker-compose.example.yml up -d --build
 #
-# Testnet-only (ENGINEERING.md §18): there is no faucet on konstellation-1 and
-# the service refuses CHAIN_ID=5667 at startup.
+# Test networks only (ENGINEERING.md §18): run one copy per network — devnet-1
+# (CHAIN_ID=56672, the primary faucet) and testnet-1 (56671), each with its own
+# key. There is no faucet on konstellation-1; the service refuses CHAIN_ID=5667.
 
 services:
   faucet:
