@@ -6,8 +6,20 @@ import { parseEther } from "viem";
 import { parseCidr, type Cidr } from "./ip.ts";
 
 export const MAINNET_CHAIN_ID = 5667; // ENGINEERING.md §1 — the faucet must never run here
-export const TESTNET_CHAIN_ID = 56671;
+export const DEVNET_CHAIN_ID = 56672; // devnet-1 — the primary faucet (dapp developers)
+export const TESTNET_CHAIN_ID = 56671; // testnet-1 — validator/ops rehearsal network
 export const LOCAL_CHAIN_ID = 56670;
+
+/**
+ * Display names of the networks a faucet may run on (ENGINEERING.md §1, §18).
+ * One deployment serves one network, selected by CHAIN_ID; devnet-1 and
+ * testnet-1 each get their own deployment, key and genesis allocation.
+ */
+export const KNOWN_NETWORKS: Readonly<Record<number, string>> = Object.freeze({
+  [DEVNET_CHAIN_ID]: "devnet-1",
+  [TESTNET_CHAIN_ID]: "testnet-1",
+  [LOCAL_CHAIN_ID]: "local",
+});
 
 /**
  * Ceiling on AMOUNT_KASH. Not a policy number — a guard against a fat-fingered
@@ -105,10 +117,10 @@ export function loadConfig(env: Env = process.env): FaucetConfig {
   const rpcUrl = str(env, "RPC_URL");
   if (!/^https?:\/\//.test(rpcUrl)) throw new ConfigError("RPC_URL must be an http(s) URL");
 
-  const chainId = int(env, "CHAIN_ID", TESTNET_CHAIN_ID, 1, 2 ** 32);
+  const chainId = int(env, "CHAIN_ID", DEVNET_CHAIN_ID, 1, 2 ** 32);
   if (chainId === MAINNET_CHAIN_ID) {
     // ENGINEERING.md §18: the faucet does not exist on konstellation-1.
-    throw new ConfigError(`CHAIN_ID ${MAINNET_CHAIN_ID} is konstellation-1 (mainnet); the faucet is testnet-only`);
+    throw new ConfigError(`CHAIN_ID ${MAINNET_CHAIN_ID} is konstellation-1 (mainnet); the faucet is testnet-only (devnet-1, testnet-1)`);
   }
 
   const amountKash = str(env, "AMOUNT_KASH", "10");
@@ -226,7 +238,7 @@ export function loadConfig(env: Env = process.env): FaucetConfig {
     redisUrl,
     captcha: { provider: captchaProvider, secret: captchaSecret, siteKey: captchaSiteKey },
     allowNoCaptcha,
-    networkName: str(env, "NETWORK_NAME", chainId === TESTNET_CHAIN_ID ? "testnet-1" : `chain ${chainId}`),
+    networkName: str(env, "NETWORK_NAME", KNOWN_NETWORKS[chainId] ?? `chain ${chainId}`),
     explorerTxUrl: env["EXPLORER_TX_URL"]?.trim() || undefined,
   };
 }

@@ -1,4 +1,4 @@
-# Konstellation testnet-1 faucet. Deployment image only — this repo produces
+# Konstellation devnet-1 / testnet-1 faucet. Deployment image only — this repo produces
 # no release binary (ENGINEERING.md §5: `konstellation` is the one repo that
 # does). The faucet key is NOT baked in: pass FAUCET_PRIVATE_KEY at runtime
 # as a secret (see README.md "Key handling").

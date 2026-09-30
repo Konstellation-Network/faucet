@@ -109,7 +109,7 @@ ${captchaScript}
     <button id="go" type="submit">Request ${esc(o.amountKash)} KASH</button>
   </form>
   <div id="result" role="status" aria-live="polite"></div>
-  <footer>Testnet only — there is no faucet on konstellation-1. Status: <a href="/healthz">/healthz</a>.</footer>
+  <footer>Devnet and testnet only — there is no faucet on konstellation-1 (mainnet). Status: <a href="/healthz">/healthz</a>.</footer>
 </main>
 <script id="cfg" type="application/json">${cfg.replace(/</g, "\\u003c")}</script>
 <script src="/app.js"></script>

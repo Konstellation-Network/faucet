@@ -10,7 +10,7 @@
 * @defidevrel @Evangel90 @Levi-Ojukwu @OlolaJaco @Psalmuel01
 
 # The send path and the blocked-recipient list are where a bug spends the
-# testnet liquidity bucket or sends it somewhere unspendable. Same owners,
+# devnet/testnet liquidity bucket or sends it somewhere unspendable. Same owners,
 # listed separately so a stricter rule (e.g. two reviewers) can be attached
 # without touching the catch-all above. CODEOWNERS is last-match-wins.
 /src/sender.ts   @defidevrel @Evangel90 @Levi-Ojukwu @OlolaJaco @Psalmuel01

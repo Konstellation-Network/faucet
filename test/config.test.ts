@@ -9,7 +9,7 @@ const CIDRS = { TRUSTED_PROXY_CIDRS: "10.0.0.0/8" };
 describe("loadConfig", () => {
   it("applies the documented defaults", () => {
     const c = loadConfig(base);
-    expect(c.chainId).toBe(56671);
+    expect(c.chainId).toBe(56672);
     expect(c.amountKash).toBe("10");
     expect(c.amountWei).toBe(parseEther("10"));
     expect(c.cooldownSeconds).toBe(86_400);
@@ -19,7 +19,7 @@ describe("loadConfig", () => {
     expect(c.trustProxy).toBe(false);
     expect(c.rateLimitStore).toBe("memory");
     expect(c.captcha.provider).toBe("off");
-    expect(c.networkName).toBe("testnet-1");
+    expect(c.networkName).toBe("devnet-1");
     expect(c.bech32Prefix).toBe("kons");
   });
 
@@ -36,6 +36,17 @@ describe("loadConfig", () => {
   it("refuses the mainnet chain id", () => {
     expect(() => loadConfig({ ...base, CHAIN_ID: "5667" })).toThrow(/testnet-only/);
     expect(loadConfig({ ...base, CHAIN_ID: "56670" }).chainId).toBe(56670);
+  });
+
+  it("serves devnet-1 (primary) and testnet-1, one network per deployment", () => {
+    const dev = loadConfig({ ...base, CHAIN_ID: "56672" });
+    expect(dev.chainId).toBe(56672);
+    expect(dev.networkName).toBe("devnet-1");
+    const test = loadConfig({ ...base, CHAIN_ID: "56671" });
+    expect(test.chainId).toBe(56671);
+    expect(test.networkName).toBe("testnet-1");
+    expect(loadConfig({ ...base, CHAIN_ID: "56670" }).networkName).toBe("local");
+    expect(loadConfig({ ...base, CHAIN_ID: "56671", NETWORK_NAME: "rehearsal" }).networkName).toBe("rehearsal");
   });
 
   it("caps the per-request amount", () => {
