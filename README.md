@@ -198,3 +198,7 @@ src/
 test/              vitest; test/fake-rpc.ts is an in-memory JSON-RPC node for the real sender
 scripts/           secret-scan.mjs (CI)
 ```
+
+## License
+
+Licensed under the [Apache License 2.0](LICENSE). The Konstellation name and logo are trademarks and are not licensed; see the [trademark policy](https://github.com/Konstellation-Network/.github).
